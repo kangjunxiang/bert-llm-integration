@@ -1,0 +1,30 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Large model artifacts (downloaded by user via LlamaFactory / HF mirror)
+*.bin
+*.pt
+*.pth
+*.safetensors
+adapter_*/
+checkpoint-*/

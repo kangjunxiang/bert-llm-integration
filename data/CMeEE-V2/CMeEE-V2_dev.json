@@ -1,0 +1,60 @@
+[
+  {
+    "text": "对儿童SARST细胞亚群的研究表明，与成人SARS相比，儿童细胞下降不明显，证明上述推测成立。",
+    "entities": [
+      {
+        "start_idx": 3,
+        "end_idx": 12,
+        "type": "bod",
+        "entity": "SARST细胞亚群"
+      },
+      {
+        "start_idx": 19,
+        "end_idx": 25,
+        "type": "dis",
+        "entity": "成人SARS"
+      },
+      {
+        "start_idx": 30,
+        "end_idx": 34,
+        "type": "sym",
+        "entity": "细胞下降"
+      },
+      {
+        "start_idx": 30,
+        "end_idx": 32,
+        "type": "bod",
+        "entity": "细胞"
+      }
+    ]
+  },
+  {
+    "text": "研究证实，细胞减少与肺内病变程度及肺内炎性病变吸收程度密切相关。",
+    "entities": [
+      {
+        "start_idx": 5,
+        "end_idx": 9,
+        "type": "sym",
+        "entity": "细胞减少"
+      },
+      {
+        "start_idx": 5,
+        "end_idx": 7,
+        "type": "bod",
+        "entity": "细胞"
+      },
+      {
+        "start_idx": 10,
+        "end_idx": 14,
+        "type": "dis",
+        "entity": "肺内病变"
+      },
+      {
+        "start_idx": 17,
+        "end_idx": 23,
+        "type": "dis",
+        "entity": "肺内炎性病变"
+      }
+    ]
+  }
+]

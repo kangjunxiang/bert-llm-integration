@@ -1,0 +1,22 @@
+CUDA_VISIBLE_DEVICES=4 nohup llamafactory-cli train \
+    --stage sft \
+    --model_name_or_path /data/yh/HF-LLM-models/hub/models--shenzhi-wang--Llama3-8B-Chinese-Chat/snapshots/f25f13cb2571e70e285121faceac92926b51e6f5 \
+    --preprocessing_num_workers 16 \
+    --finetuning_type lora \
+    --quantization_method bitsandbytes \
+    --template llama3 \
+    --flash_attn auto \
+    --dataset_dir data \
+    --eval_dataset CMeEE-V2_llm_evl_mark \
+    --cutoff_len 1536 \
+    --max_samples 100000 \
+    --per_device_eval_batch_size 2 \
+    --predict_with_generate True \
+    --max_new_tokens 1536 \
+    --num_beams 5 \
+    --repetition_penalty 1.1 \
+	--do_sample False \
+    --output_dir /data/yh/LLM-train-saves/Llama3-8B-Chinese-Chat/lora/train_lora_5epochs_num_beams5_eval \
+    --trust_remote_code True \
+    --do_predict True \
+    > ./logs/sft_train_Llama3-8B_no_lora_num_beams5_evl_mark.log 2>&1 &

@@ -1,0 +1,23 @@
+CUDA_VISIBLE_DEVICES=7 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup llamafactory-cli train \
+    --stage sft \
+    --model_name_or_path /data/yh/HF-LLM-models/hub/models--zai-org--glm-4-9b-chat/snapshots/bd8234fe5e0c09c48637a92abb0c797cb5fa0e73 \
+    --preprocessing_num_workers 16 \
+    --finetuning_type lora \
+    --quantization_method bitsandbytes \
+    --template glm4 \
+    --flash_attn auto \
+    --dataset_dir data \
+    --eval_dataset CMeEE-V2_llm_evl_mark_v2_part2 \
+    --cutoff_len 1536 \
+    --max_samples 100000 \
+    --per_device_eval_batch_size 1 \
+    --predict_with_generate True \
+    --max_new_tokens 1536 \
+	--temperature 0.1 \
+    --top_p 1 \
+	--repetition_penalty 1.1 \
+    --output_dir /data/yh/LLM-train-saves/GLM4-9B-mark-v2-evl/lora/nolora_temperature0.1_1_eval_part2 \
+    --trust_remote_code True \
+    --do_predict True \
+	--max_length 1536 \
+    > ./logs/eval_GLM4-9B_mark_v2_nolora_temperature0.1_1_evl_part2.log 2>&1 &

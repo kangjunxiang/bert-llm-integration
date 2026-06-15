@@ -1,0 +1,54 @@
+[
+  {
+    "text": "（5）房室结消融和起搏器植入作为反复发作或难治性心房内折返性心动过速的替代疗法。",
+    "entities": [
+      {
+        "start_idx": 3,
+        "end_idx": 8,
+        "type": "pro",
+        "entity": "房室结消融"
+      },
+      {
+        "start_idx": 9,
+        "end_idx": 14,
+        "type": "pro",
+        "entity": "起搏器植入"
+      },
+      {
+        "start_idx": 16,
+        "end_idx": 34,
+        "type": "dis",
+        "entity": "反复发作或难治性心房内折返性心动过速"
+      },
+      {
+        "start_idx": 35,
+        "end_idx": 39,
+        "type": "pro",
+        "entity": "替代疗法"
+      }
+    ]
+  },
+  {
+    "text": "（6）发作一次伴血流动力学损害的室性心动过速（ventriculartachycardia），可接受导管消融者。",
+    "entities": [
+      {
+        "start_idx": 8,
+        "end_idx": 22,
+        "type": "dis",
+        "entity": "血流动力学损害的室性心动过速"
+      },
+      {
+        "start_idx": 23,
+        "end_idx": 45,
+        "type": "dis",
+        "entity": "ventriculartachycardia"
+      },
+      {
+        "start_idx": 50,
+        "end_idx": 54,
+        "type": "pro",
+        "entity": "导管消融"
+      }
+    ]
+   }
+]
