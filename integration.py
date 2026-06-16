@@ -1,15 +1,15 @@
 """
-LLM + BERT 实体融合
+LLM + BERT Entity Fusion
 ========================================
-实现三种主融合策略及对应消融:
-    策略A   Static Weight Fusion         (静态权重融合, 无需训练)
-    策略A'' Vote-Aware Hard-Rule Static  (硬规则 + 票数门, 无需训练)
-    策略A_v2 Consensus V2 Hard-Rule      (per-beam 投票 + conf 分散度, 无需训练)
-    策略A_cal Calibrated Weighted Fusion (Isotonic 校准 + per-type α 加权, 无需训练)
-    策略B   Gating Network Fusion        (门控网络融合, 端到端学习)
-消融实验 (Beam-1 only):
-    策略A_b1    / 策略A_cal_b1    / 策略B_b1
-控制台输出每种策略在验证集和测试集上的 P/R/F1。
+Implements three main fusion strategies and their ablations:
+    Strategy A   Static Weight Fusion               (static-weight fusion, no training)
+    Strategy A'' Vote-Aware Hard-Rule Static        (hard rule + vote gate, no training)
+    Strategy A_v2 Consensus V2 Hard-Rule            (per-beam vote + conf spread, no training)
+    Strategy A_cal Calibrated Weighted Fusion      (Isotonic calibration + per-type α weighting, no training)
+    Strategy B   Gating Network Fusion              (gating network, end-to-end learning)
+Ablation studies (Beam-1 only):
+    Strategy A_b1    / Strategy A_cal_b1    / Strategy B_b1
+Console output shows P/R/F1 of each strategy on the validation and test sets.
 """
 
 import json
@@ -30,31 +30,33 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.isotonic import IsotonicRegression
 
 warnings.filterwarnings('ignore')
-# 全局唯一种子, 保证实验可复现
+# Single global seed to keep experiments reproducible
 GLOBAL_SEED = 42
 torch.manual_seed(GLOBAL_SEED)
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
-# 固定 Python hash 种子, 避免 dict 顺序抖动影响结果
+# Pin the Python hash seed to avoid non-determinism from dict ordering
 if not os.environ.get('PYTHONHASHSEED'):
     os.environ['PYTHONHASHSEED'] = '0'
 
 # ====================================================================
-# 0. 全局常量
+# 0. Global constants
 # ====================================================================
 ALL_TYPES = ['dis', 'sym', 'dru', 'equ', 'pro', 'bod', 'ite', 'mic', 'dep']
 NUM_TYPES = len(ALL_TYPES)
 TYPE2IDX = {t: i for i, t in enumerate(ALL_TYPES)}
 
-# 位置容差: LLM/BERT 预测位置 |diff| <= TOL 视为同一实体
+# Position tolerance: predictions from LLM/BERT with |start diff| <= TOL are
+# treated as referring to the same entity
 POSITION_TOLERANCE = 2
 
 
 # ====================================================================
-# 1. 数据解析
+# 1. Data parsing
 # ====================================================================
 def _safe_parse_json(line: str):
-    """安全解析 JSON, 失败时回退到 ast.literal_eval (兼容单引号格式)。"""
+    """Safely parse JSON; fall back to ast.literal_eval on failure
+    (supports single-quoted strings)."""
     try:
         return json.loads(line.strip())
     except (json.JSONDecodeError, ValueError):
@@ -65,9 +67,11 @@ def _safe_parse_json(line: str):
 
 
 def _is_mark_format_line(line: str) -> bool:
-    """检测单行是否为 mark 格式 (predict 字段含 ' :' 标记)。
+    """Detect whether a single line uses the mark annotation format
+    (the predict field contains the ' :' marker).
 
-    mark 格式特征: 行内有 ' :' 且在方括号两侧, 例如 "[entity] :type"。
+    Mark format signature: the line contains ' :' flanked by square brackets,
+    e.g. "[entity] :type".
     """
     obj = _safe_parse_json(line)
     if obj is None:
@@ -88,7 +92,7 @@ def _is_mark_format_line(line: str) -> bool:
 
 
 def _clean_entity_type(etype: str):
-    """清理实体类型, 返回有效类型或 None"""
+    """Sanitize an entity type, returning a valid type or None."""
     VALID = set(ALL_TYPES)
     if etype in VALID:
         return etype
@@ -97,7 +101,8 @@ def _clean_entity_type(etype: str):
 
 
 def _split_mark_line(line):
-    """将 'etype : content' 拆成 (etype, content), 失败返回 None"""
+    """Split a line of the form 'etype : content' into (etype, content);
+    return None on failure."""
     line = line.strip()
     if not line or ' :' not in line:
         return None
@@ -108,11 +113,15 @@ def _split_mark_line(line):
 
 
 def _entities_with_pos_in_content(content):
-    """从单行 mark content 中抽取实体 (start, end, entity), start/end 是行内偏移 (剔除 [] 后)。
+    """Extract (start, end, entity) triples from a single mark-format content
+    line. start/end are in-line offsets after stripping the surrounding [],
+    and entity is already trimmed.
 
-    兼容两种格式:
-      A) 原句 + [entity] 标记  → 精确偏移
-      B) 裸实体: '稽留热、弛张热' → 按 [、,;；] 切分, 偏移在 content 内的实际位置
+    Two input forms are supported:
+      A) Original sentence with [entity] markers  → exact offsets
+      B) Bare entities: 'fever_A, fever_B' (or Chinese terms such as
+         '稽留热、弛张热' for medical NER) → split on [、,;；], offsets
+         are positions within the content
     """
     out = []
     bracket = list(re.finditer(r'\[(.*?)\]', content))
@@ -138,10 +147,12 @@ def _entities_with_pos_in_content(content):
 
 
 def parse_marked_text_with_pos(text: str):
-    """解析 mark 格式文本, 返回 [(start, end, entity, type, line_idx), ...]
+    """Parse mark-format text into a list of
+    (start, end, entity, type, line_idx) tuples.
 
-    位置是剔除 [ 和 ] 后, 在该行内容中的真实索引, 闭区间 (start + len(entity) - 1)。
-    兼容 [entity] 标记与裸实体两种格式。
+    Positions are real indices inside the line content after stripping [ and ],
+    closed interval (start + len(entity) - 1).
+    Both the [entity] marker form and the bare-entity form are supported.
     """
     result = []
     for line_idx, line in enumerate(text.strip().split('\n')):
@@ -159,18 +170,20 @@ def parse_marked_text_with_pos(text: str):
 
 def _correct_entity_positions(entities_with_pos, original_text, tolerance=2,
                               keep_all_matches=False):
-    """校正位置到原始完整文本中的真实位置。
+    """Realign mark-format positions to their true indices inside the
+    full `original_text`.
 
-    规则:
-      1. 实体不在 original_text 中 → 丢弃 (LLM 幻觉, 不参与评估)
-      2. 实体在 original_text 中, 位置已正确 → 保留
-      3. 实体在 original_text 中, 位置不匹配:
-         a. 仅 1 处匹配 → 直接使用该位置
-         b. 多处匹配:
-            - keep_all_matches=False (默认): 启用位置容差 `tolerance`,
-              优先选 |match.start - 预测 start| <= tolerance 中距离最近的位置;
-              若无容差内匹配, 退而选全部匹配中距离最近的位置
-            - keep_all_matches=True: 全部采用, 把每一处匹配都作为候选位置加入
+    Rules:
+      1. Entity not present in original_text → drop (LLM hallucination, not
+         counted in evaluation).
+      2. Entity present, position already correct → keep as is.
+      3. Entity present, position mismatched:
+         a. Exactly one occurrence → use that occurrence.
+         b. Multiple occurrences:
+            - keep_all_matches=False (default): within `tolerance` of the
+              predicted start, pick the closest occurrence; if none qualifies,
+              fall back to the closest occurrence overall.
+            - keep_all_matches=True:  keep every occurrence as a candidate.
     """
     if not original_text:
         return entities_with_pos
@@ -208,7 +221,8 @@ def _correct_entity_positions(entities_with_pos, original_text, tolerance=2,
 
 
 def _parse_mark_format_predict(predict_text, original_text=None, default_conf=0.8):
-    """mark 格式 predict → entity_dict: {(start,end,type,entity): {conf,entity,type,start,end}}"""
+    """Mark-format predict → entity_dict:
+    {(start, end, type, entity): {conf, entity, type, start, end}}"""
     ents = parse_marked_text_with_pos(predict_text)
     ents = _correct_entity_positions(ents, original_text)
     out = {}
@@ -220,19 +234,20 @@ def _parse_mark_format_predict(predict_text, original_text=None, default_conf=0.
     return out
 
 
-# LLM 多 beam 聚合参数 (max+mean+vote_reward 模型)
-# 公式:  P = α · max(c_i) + (1-α) · mean(c_i) + β · (N-1)
-#  - α: 最佳 beam conf 的权重 (默认 0.7)
-#  - β: 投票数线性奖励 (默认 0.05)
-#  - N: 预测该实体的 beam 数量
+# LLM multi-beam aggregation parameters (max+mean+vote_reward model)
+# Formula:  P = α · max(c_i) + (1-α) · mean(c_i) + β · (N-1)
+#  - α: weight for the best-beam confidence (default 0.7)
+#  - β: linear reward for the number of agreeing beams (default 0.05)
+#  - N: number of beams that predicted this entity
 LLM_ALPHA = None      # type: float | None
 LLM_VOTE_REWARD = None  # type: float | None
 
 
 def _aggregate_llm_conf(confs, beam_idxs, alpha, beta):
-    """max+mean+vote_reward 聚合多 beam 预测同一实体的置信度。
+    """Aggregate the confidences of multiple beams that predicted the same
+    entity using the max+mean+vote_reward rule.
 
-    P = α · max(c_i) + (1-α) · mean(c_i) + β · (N-1), clamp 到 [0, 1]
+    P = α · max(c_i) + (1-α) · mean(c_i) + β · (N-1), clamped to [0, 1]
     """
     if not confs:
         return 0.0
@@ -243,11 +258,13 @@ def _aggregate_llm_conf(confs, beam_idxs, alpha, beta):
 
 
 def _parse_mark_format_beam(models, original_text, default_conf=0.8):
-    """多 beam 预测的 max+mean+vote_reward 聚合。
+    """max+mean+vote_reward aggregation over multiple beams.
 
-    输入: models = [ {predict: str, confidence: float}, ... ]  (按 beam 排名 1→N)
-    输出: { (start,end,type,text): {confidence, vote_count, best_beam_idx,
-              best_beam_conf, beam_idxs, beam_confs, llm_avg_conf, llm_max_conf, ...} }
+    Input:  models = [ {predict: str, confidence: float}, ... ]
+            (ranked 1→N by beam)
+    Output: { (start, end, type, text): {confidence, vote_count, best_beam_idx,
+              best_beam_conf, beam_idxs, beam_confs, llm_avg_conf,
+              llm_max_conf, ...} }
     """
     if not models:
         return {}
@@ -299,7 +316,7 @@ def _parse_mark_format_beam(models, original_text, default_conf=0.8):
 
 
 def _parse_mark_format_label(label_text):
-    """mark 格式 label → [{entity,start_idx,end_idx,type}, ...]"""
+    """Mark-format label → [{entity, start_idx, end_idx, type}, ...]"""
     return [
         {'entity': txt, 'start_idx': s, 'end_idx': e, 'type': t}
         for s, e, txt, t, _ in parse_marked_text_with_pos(label_text)
@@ -307,7 +324,8 @@ def _parse_mark_format_label(label_text):
 
 
 def _normalize_entity_confidences(entity_dict):
-    """归一化置信度到 [0, 1]; 全相同时不动, 避免引入随机噪声。"""
+    """Normalize confidences into [0, 1]; leave them untouched when all values
+    are the same to avoid injecting random noise."""
     if not entity_dict:
         return entity_dict
     confs = [v['confidence'] for v in entity_dict.values()]
@@ -320,10 +338,13 @@ def _normalize_entity_confidences(entity_dict):
 
 
 def parse_llm_line(line, source='ner_models', use_beam=False, default_conf=0.8):
-    """解析 LLM 文件一行 → (text, entity_dict, label_entities, llm_parse_error)
+    """Parse one LLM file line →
+    (text, entity_dict, label_entities, llm_parse_error).
 
-    use_beam=True:  对多 beam 投票, entity_dict 中包含 vote_count / llm_avg_conf / llm_max_conf
-    use_beam=False: 仅用第 1 个 beam, c['llm_conf'] = Beam-1 真实 conf, vote_count=1
+    use_beam=True:  vote over multiple beams; entity_dict carries
+                    vote_count / llm_avg_conf / llm_max_conf.
+    use_beam=False: use only the first beam; c['llm_conf'] is the true
+                    Beam-1 confidence, vote_count=1.
     """
     obj = _safe_parse_json(line)
     if obj is None:
@@ -331,7 +352,7 @@ def parse_llm_line(line, source='ner_models', use_beam=False, default_conf=0.8):
     text = obj['text']
     models = obj.get(source, []) or obj.get('ner_models', [])
 
-    # 解析 label 作 ground truth
+    # Parse the label as the ground truth
     if _is_mark_format_line(line):
         label_text = obj.get('label', '')
         label_entities = _parse_mark_format_label(label_text) if isinstance(label_text, str) else \
@@ -353,12 +374,14 @@ def parse_llm_line(line, source='ner_models', use_beam=False, default_conf=0.8):
         if use_beam and len(models) >= 2:
             entity_dict = _parse_mark_format_beam(models, text, default_conf=default_conf)
         else:
-            # 单 beam 也走 beam 聚合函数, 让 cand 携带真实 conf + vote_count=1, 统一接口
+            # Single-beam path also goes through the beam aggregator so that
+            # the candidate carries the real conf plus vote_count=1,
+            # keeping a unified interface.
             entity_dict = _parse_mark_format_beam(models[:1], text, default_conf=default_conf)
         entity_dict = _normalize_entity_confidences(entity_dict)
         return text, entity_dict, label_entities, obj.get('llm_parse_error', False)
 
-    # 标准 JSON 格式
+    # Standard JSON format
     entity_dict = {}
     for model in models:
         mconf = model.get('confidence', 0.0)
@@ -396,8 +419,8 @@ def parse_llm_line(line, source='ner_models', use_beam=False, default_conf=0.8):
 
 
 def parse_bert_line(line):
-    """解析 BERT 文件一行 → (text, [entity dicts])
-    BERT 的 start_idx = label 位置 + 1, 这里减 1 对齐 LLM。
+    """Parse one BERT file line → (text, [entity dicts])
+    BERT's start_idx = label position + 1, so we subtract 1 to align with LLM.
     """
     obj = json.loads(line.strip())
     text = obj['full_text']
@@ -415,10 +438,10 @@ def parse_bert_line(line):
 
 
 # ====================================================================
-# 2. 候选生成 / 匹配
+# 2. Candidate generation / matching
 # ====================================================================
 def _entities_match(e1, e2, tol=0):
-    """同 type + 同 text + |start 差| <= tol 视为同一实体"""
+    """Same type + same text + |start diff| <= tol → considered the same entity."""
     if e1.get('entity', '') != e2.get('entity', ''):
         return False
     if e1.get('type', '') != e2.get('type', ''):
@@ -429,17 +452,19 @@ def _entities_match(e1, e2, tol=0):
 
 
 def _entity_key(e):
-    """(start_idx, entity_text, type) — 用于候选 key / 评估"""
+    """(start_idx, entity_text, type) — used as candidate key / for evaluation."""
     return (e['start_idx'], e['entity'], e['type'])
 
 
 def build_candidates(text, entity_dict, bert_entities, tol=0):
-    """合并 LLM 实体 (entity_dict) 与 BERT 实体, 输出候选列表。
+    """Merge LLM entities (entity_dict) with BERT entities and emit a candidate
+    list.
 
-    每条候选: {start_idx, end_idx, type, entity, llm_conf, bert_conf,
-                llm_present, bert_present, [可选 beam 特征] ...}
-    合并原则: 同一 (start, entity, type) 优先合并; 否则 (type, entity 相同
-    且 |start 差| <= tol) 也视为同一候选, BERT 侧匹配最近 LLM 候选。
+    Each candidate: {start_idx, end_idx, type, entity, llm_conf, bert_conf,
+                     llm_present, bert_present, [optional beam features] ...}
+    Merge rule: prefer merging on the same (start, entity, type); otherwise,
+    (same type, same entity with |start diff| <= tol) is also considered the
+    same candidate, and BERT matches the closest LLM candidate.
     """
     cand_dict = {}
     llm_list = list(entity_dict.values())
@@ -498,7 +523,7 @@ def build_candidates(text, entity_dict, bert_entities, tol=0):
 
 
 def _label_set(label_entities, tol=0):
-    """构建 label key 集合 (位置容差扩展)。"""
+    """Build the label key set (with position tolerance expansion)."""
     if tol <= 0:
         return {(int(e['start_idx']), e.get('entity', ''), e.get('type', ''))
                 for e in label_entities if 'start_idx' in e}
@@ -510,7 +535,7 @@ def _label_set(label_entities, tol=0):
 
 
 def _entities_match_in_list(target, candidates, tol=0):
-    """在 candidates 中找第一个与 target 匹配的实体"""
+    """Find the first entity in `candidates` that matches `target`."""
     for c in candidates:
         if _entities_match(target, c, tol):
             return c
@@ -518,10 +543,11 @@ def _entities_match_in_list(target, candidates, tol=0):
 
 
 def _reaggregate_llm_confs(samples, alpha, beta):
-    """按新的 (α, β) 重新算每个 candidate 的 llm_conf。
+    """Recompute each candidate's llm_conf under the new (α, β).
 
-    不重 build_samples, 直接用候选里已存的 beam_confs 重算, 避免重复解析文本。
-    优先使用 c['beam_confs']; 缺失时退化为 c['llm_max_conf'] + c['llm_conf'] 双点近似。
+    Reuses the beam_confs already stored in each candidate; no re-parsing.
+    Falls back to a 2-point approximation ([llm_max_conf, llm_conf]) when
+    beam_confs is missing.
     """
     for s in samples:
         for c in s['candidates']:
@@ -541,12 +567,12 @@ def _reaggregate_llm_confs(samples, alpha, beta):
 
 
 # ====================================================================
-# 3. 评估函数
+# 3. Evaluation
 # ====================================================================
 def evaluate(preds_list, labels_list, tol=0):
-    """startIndexMatch 评估: 统计 (start_idx, entity, type) 三元组集合的命中。
-
-    tol: 位置容差 (论文主评估: 2)。
+    """startIndexMatch evaluation: count hits of the
+    (start_idx, entity, type) triple set.
+    tol: position tolerance (paper main evaluation: 2).
     """
     tp, total_pred, total_true = _precompute_metrics(preds_list, labels_list, tol)
     tp = int(tp.sum()); total_pred = int(total_pred.sum()); total_true = int(total_true.sum())
@@ -557,9 +583,10 @@ def evaluate(preds_list, labels_list, tol=0):
 
 
 def _precompute_metrics(preds_list, labels_list, tol=0):
-    """预计算每个样本的 (tp, |p_set|, |l_set|) → 返回 3 个 np.array。
+    """Precompute (tp, |p_set|, |l_set|) for each sample → returns 3 np.arrays.
 
-    用途: bootstrap 重采样时直接向量化和, 不再重算 set 交集。
+    Used by bootstrap resampling for vectorized sums (no set-intersection
+    recomputation).
     """
     n = len(preds_list)
     tps = np.empty(n, dtype=np.int64)
@@ -591,10 +618,11 @@ def _precompute_metrics(preds_list, labels_list, tol=0):
 
 def bootstrap_f1_ci(preds_list, labels_list, n_boot=1000, alpha=0.05,
                     tol=0, seed=GLOBAL_SEED):
-    """Paired Bootstrap 算 F1 的 95% 置信区间。
+    """Paired bootstrap for the F1 95% confidence interval.
 
-    方法: 有放回重采样文本索引 n_boot 次, 每次算 F1, 取 [α/2, 1-α/2] 分位数。
-    返回: (mean, lo, hi, std)
+    Method: resample text indices with replacement n_boot times, compute F1
+    for each, and take the [α/2, 1-α/2] percentiles.
+    Returns: (mean, lo, hi, std)
     """
     rng = np.random.RandomState(seed)
     n = len(preds_list)
@@ -620,9 +648,9 @@ def bootstrap_f1_ci(preds_list, labels_list, n_boot=1000, alpha=0.05,
 
 def paired_bootstrap_pvalue(preds_a, labels_a, preds_b, labels_b,
                              n_boot=1000, tol=0, seed=GLOBAL_SEED):
-    """Paired Bootstrap 检验 H0: F1(B) - F1(A) = 0。
+    """Paired bootstrap test of H0: F1(B) - F1(A) = 0.
 
-    返回: (delta_mean, delta_ci_lo, delta_ci_hi, p_value_two_sided)
+    Returns: (delta_mean, delta_ci_lo, delta_ci_hi, p_value_two_sided)
     """
     rng = np.random.RandomState(seed)
     n = len(preds_a)
@@ -636,7 +664,8 @@ def paired_bootstrap_pvalue(preds_a, labels_a, preds_b, labels_b,
 
 def paired_bootstrap_pvalue_from_arr(tps_a, pns_a, tns_a, tps_b, pns_b, tns_b,
                                       n_boot=1000, seed=GLOBAL_SEED):
-    """paired_bootstrap_pvalue 的预计算数组版本, 多策略共享预计算结果。"""
+    """Array version of paired_bootstrap_pvalue: precomputed arrays can be
+    shared across multiple strategies."""
     rng = np.random.RandomState(seed)
     n = len(tps_a)
     if n == 0 or len(tps_b) != n:
@@ -661,7 +690,7 @@ def paired_bootstrap_pvalue_from_arr(tps_a, pns_a, tns_a, tps_b, pns_b, tns_b,
     deltas.sort()
     lo = deltas[int(0.025 * n_boot)]
     hi = deltas[int(0.975 * n_boot) - 1]
-    # 双边 p-value: H1: ΔF1 ≠ 0
+    # Two-sided p-value: H1: ΔF1 ≠ 0
     n_le = int((deltas <= 0).sum())
     n_gt = n_boot - n_le
     p_val = float(min(n_le, n_gt) * 2 / n_boot)
@@ -671,7 +700,8 @@ def paired_bootstrap_pvalue_from_arr(tps_a, pns_a, tns_a, tps_b, pns_b, tns_b,
 
 def bootstrap_f1_ci_from_arr(tps, pns, tns, n_boot=1000, alpha=0.05,
                               seed=GLOBAL_SEED):
-    """bootstrap_f1_ci 的预计算数组版本, 多策略共享预计算结果。"""
+    """Array version of bootstrap_f1_ci: precomputed arrays can be shared
+    across multiple strategies."""
     rng = np.random.RandomState(seed)
     n = len(tps)
     if n == 0:
@@ -701,9 +731,10 @@ def print_metrics(name, p, r, f1, tp=None, tp_pred=None, tp_true=None):
 
 
 def _type_only_f1(samples, target_type, source='bert', conf_th=0.5):
-    """按 type 评估单模型 F1。
-    source='bert' → 只看 BERT-only 候选, 若 bert_conf >= conf_th 则预测
-    source='llm'  → 只看 LLM-only + consensus 候选, 若 llm_conf >= conf_th 则预测
+    """Per-type F1 of a single model.
+    source='bert' → only BERT-only candidates; predict when bert_conf >= conf_th.
+    source='llm'  → only LLM-only + consensus candidates; predict when
+                    llm_conf >= conf_th.
     """
     preds_list, labels_list = [], []
     for s in samples:
@@ -727,9 +758,10 @@ def _type_only_f1(samples, target_type, source='bert', conf_th=0.5):
 
 def eval_llm_beam_k(llm_lines, bert_lines, beam_idx=0, default_conf=0.8,
                     source='ner_models'):
-    """模拟 LLM 只用第 beam_idx 个 beam 预测, 算 P/R/F1。
+    """Simulate LLM using only the beam_idx-th beam and compute P/R/F1.
 
-    关键: ground truth 必须用 LLM 文件的 label 字段 (人工标注), 不是 BERT 文件的 entities。
+    Note: ground truth must come from the LLM file's `label` field
+    (manual annotation), not from the BERT file's `entities`.
     """
     preds, labels = [], []
     for ll, bl in zip(llm_lines, bert_lines):
@@ -762,7 +794,7 @@ def eval_llm_beam_k(llm_lines, bert_lines, beam_idx=0, default_conf=0.8,
 
 
 # ====================================================================
-# 4. 数据加载 & 划分
+# 4. Data loading & splitting
 # ====================================================================
 def load_data(llm_path, bert_path):
     with open(llm_path, 'r', encoding='utf-8') as f1, \
@@ -774,7 +806,8 @@ def load_data(llm_path, bert_path):
 
 
 def split_train_test(llm_lines, bert_lines, test_size=2000, seed=GLOBAL_SEED):
-    """按 test_size 切分测试集, 其余为训练集, 用 seed 复现切分结果。"""
+    """Split out the test set by test_size; remainder is the train set.
+    Uses the given seed for reproducible splits."""
     n = len(llm_lines)
     rng = np.random.RandomState(seed)
     test_idx = rng.choice(np.arange(n), size=min(test_size, n), replace=False)
@@ -789,10 +822,13 @@ def split_train_test(llm_lines, bert_lines, test_size=2000, seed=GLOBAL_SEED):
 
 def build_samples(llm_lines, bert_lines, source='ner_models', tol=POSITION_TOLERANCE,
                   use_beam=False):
-    """对每行生成 (text, candidates, label_set) 三元组, 用于训练门控网络 / 评估。
+    """Generate (text, candidates, label_set) triples for every line; used to
+    train the gating network / for evaluation.
 
-    use_beam=True:  解析 LLM 时使用 5-beam 投票, 候选中携带 vote_count 等特征。
-    ground truth 一律采用 LLM 文件 label 字段 (人工标注)。
+    use_beam=True:  When parsing the LLM output, use 5-beam voting; the
+        generated candidates carry extra features such as vote_count.
+    Ground truth always comes from the `label` field of the LLM file
+    (human-annotated).
     """
     samples = []
     for i, (ll, bl) in enumerate(zip(llm_lines, bert_lines)):
@@ -827,13 +863,14 @@ def build_samples(llm_lines, bert_lines, source='ner_models', tol=POSITION_TOLER
 
 
 # ====================================================================
-# 5. 策略A: 静态权重融合 (Static Weight Fusion)
+# 5. Strategy A: Static Weight Fusion
 # ====================================================================
-# 思路: 不训练, 在验证集上统计 BERT-only F1 和 LLM-only F1, 然后用两者比值
-# 作为权重: α = bert_F1 / (bert_F1 + llm_F1), score = α*bert_conf + (1-α)*llm_conf
-# 网格搜索全局阈值 th, 进一步 per-type 调阈值。
+# Idea: no training. Compute BERT-only F1 and LLM-only F1 on the validation
+# set, then use the ratio as the weight:
+# α = bert_F1 / (bert_F1 + llm_F1),  score = α*bert_conf + (1-α)*llm_conf
+# A global threshold `th` is grid-searched, then refined per type.
 def bert_only_predict(samples, llm_lines, bert_lines, source='ner_models'):
-    """BERT Only baseline: 仅保留 BERT 预测的实体。"""
+    """BERT Only baseline: only keep the entities predicted by BERT."""
     preds_list, labels_list = [], []
     for s in samples:
         bert_pred = [c for c in s['candidates'] if c['bert_present']]
@@ -844,15 +881,16 @@ def bert_only_predict(samples, llm_lines, bert_lines, source='ner_models'):
 
 def llm_only_predict(samples, llm_lines=None, bert_lines=None,
                      source='ner_models', beam_idx=None, conf_th=None):
-    """LLM Only baseline: 仅保留 LLM 预测的实体。
+    """LLM Only baseline: only keep the entities predicted by the LLM.
 
-    参数:
+    Parameters:
         beam_idx: int | None
-            None  -> 5-beam 并集 (无阈值, 仅按位置去重)  ← ablation
-            0..4  -> 仅用第 beam_idx 个 beam 预测    ← 论文主基线 (LLM Top-1)
+            None  -> 5-beam union (no threshold; position-deduped)  ← ablation
+            0..4  -> only use the beam_idx-th beam                  ← paper main
+                     baseline (LLM Top-1)
         conf_th: float | None
-            None   -> 不做 conf 过滤
-            0.0~1  -> 仅保留 best_beam_conf >= conf_th 的实体
+            None   -> no confidence filtering
+            0.0~1  -> keep only entities with best_beam_conf >= conf_th
     """
     preds_list, labels_list = [], []
     for s in samples:
@@ -875,7 +913,7 @@ def llm_only_predict(samples, llm_lines=None, bert_lines=None,
 
 
 def per_type_f1(samples, source='ner_models'):
-    """在验证集上按 type 统计 BERT-only 和 LLM-only 的实体级 F1。"""
+    """Per-type entity-level F1 of BERT-only and LLM-only on the validation set."""
     bert_tp = defaultdict(int); bert_pred = defaultdict(int); bert_true = defaultdict(int)
     llm_tp = defaultdict(int);  llm_pred = defaultdict(int);  llm_true = defaultdict(int)
 
@@ -906,7 +944,8 @@ def per_type_f1(samples, source='ner_models'):
 
 
 def _consensus_stats(samples):
-    """统计: 共识 (BERT+LLM 同预测) 的精确率 / 单独预测的精确率, 是策略 A 共识加成的依据。"""
+    """Statistics: precision of consensus (BERT+LLM agree) vs single-source
+    predictions. Used as the basis for the consensus bonus in Strategy A."""
     both_p = both_t = 0
     bert_p = bert_t = 0
     llm_p = llm_t = 0
@@ -935,12 +974,13 @@ def static_fusion_predict(samples, type_alphas, type_thresholds,
                           consensus_bonus=0.10, consensus_th_mult=0.85,
                           bert_only_factor=1.0, llm_only_factor=1.0,
                           vote_bonus_coef=0.05):
-    """静态权重融合 (3-case 评分)。
+    """Static weight fusion (3-case scoring).
 
-    核心思想: 共识实体的精度远高于单源预测, 应当显著加分并降低阈值。
+    Core idea: consensus entities have much higher precision than single-source
+    predictions, so they should get a sizeable bonus and a lower threshold.
         both-present: score = α*bert + (1-α)*llm + bonus + vote_bonus_coef * log(vc)/log(5),  th *= consensus_th_mult
-        bert-only:    score = bert_only_factor * bert_conf,  th 不变
-        llm-only:     score = llm_only_factor * llm_conf,   th 不变
+        bert-only:    score = bert_only_factor * bert_conf,  th unchanged
+        llm-only:     score = llm_only_factor  * llm_conf,   th unchanged
     """
     preds_list, labels_list = [], []
     for s in samples:
@@ -975,17 +1015,19 @@ def static_fusion_predict_metrics(samples, type_alphas, type_thresholds,
                                     consensus_bonus=0.10, consensus_th_mult=0.85,
                                     bert_only_factor=1.0, llm_only_factor=1.0,
                                     vote_bonus_coef=0.05):
-    """static_fusion_predict 的快速版本: 返回 (tps, pns, tns) np.array, 不构 list of dict。
+    """Fast version of static_fusion_predict: returns (tps, pns, tns) np.arrays
+    directly, without building a list of dicts.
 
-    利用 s['label_set'] (已是 set) 算 hit, 比 evaluate 快 5-10x。
-    用途: run_static_fusion 全局网格 6000 次 evaluate 加速。
+    Uses s['label_set'] (already a set) for O(1) hit checks, ~5-10× faster
+    than `evaluate`. Used to accelerate the 6000-cell global grid in
+    `run_static_fusion`.
     """
     n = len(samples)
     tps = np.zeros(n, dtype=np.int64)
     pns = np.zeros(n, dtype=np.int64)
     tns = np.empty(n, dtype=np.int64)
     for i, s in enumerate(samples):
-        lset = s['label_set']  # 已 tol 膨胀, 仅用于 O(1) 命中检查
+        lset = s['label_set']  # Already tolerance-expanded, used for O(1) hit checks
         n_keep = 0; n_hit = 0
         for c in s['candidates']:
             t = c['type']
@@ -1010,13 +1052,15 @@ def static_fusion_predict_metrics(samples, type_alphas, type_thresholds,
                     n_hit += 1
         tps[i] = n_hit
         pns[i] = n_keep
-        # 注意: label_set 已 tol 膨胀, 不能直接 len; 用真 label 数 (与 evaluate 对齐)
+        # Note: label_set is already tolerance-expanded; do NOT use len(lset)
+        # directly — use the true label count to match `evaluate`.
         tns[i] = len(s['label_entities'])
     return tps, pns, tns
 
 
 def _f1_from_arr(tps, pns, tns):
-    """从 (tps, pns, tns) 数组整体算 P/R/F1 — 给 fast 版 evaluate 用"""
+    """Compute P/R/F1 from the (tps, pns, tns) arrays — used by the fast
+    version of `evaluate`."""
     tp = int(tps.sum())
     pn = int(pns.sum())
     tn = int(tns.sum())
@@ -1027,47 +1071,51 @@ def _f1_from_arr(tps, pns, tns):
 
 
 def run_static_fusion(train_samples, test_samples):
-    """策略 A: 静态权重融合 (3-case, 含共识加成)"""
+    """Strategy A: Static Weight Fusion (3-case, with consensus bonus)."""
     print("\n" + "=" * 70)
-    print("【策略 A】Static Weight Fusion (静态权重融合 · 3-case)")
+    print("【Strategy A】Static Weight Fusion (3-case)")
     print("=" * 70)
-    print("思路: 共识实体的精度远高于单源预测。")
-    print("      - both-present: score = α*bert + (1-α)*llm + bonus, 阈值 × mult")
+    print("Idea: consensus entities have much higher precision than single-source.")
+    print("      - both-present: score = α*bert + (1-α)*llm + bonus, threshold × mult")
     print("      - bert-only:    score = bert_conf")
     print("      - llm-only:     score = llm_conf")
-    print("      网格搜: α (per-type) + bonus / mult / factor (全局) + 阈值 (per-type)")
+    print("      Grid search: α (per-type) + bonus / mult / factor (global) + threshold (per-type)")
     print("-" * 70)
 
-    # 1) 验证集 per-type F1 (用于 α) + 共识诊断
+    # 1) Per-type F1 on the validation set (used for α) + consensus diagnosis
     bert_f1, llm_f1 = per_type_f1(train_samples)
     cs = _consensus_stats(train_samples)
-    print("  [1] 验证集单模型 F1 + 共识诊断:")
+    print("  [1] Validation per-model F1 + consensus diagnosis:")
     print(f"      {'type':<6} {'BERT F1':>9} {'LLM F1':>9} {'α':>8}")
     for t in ALL_TYPES:
         b, l = bert_f1[t], llm_f1[t]
         denom = b + l
         a = b / denom if denom > 0 else 0.5
         print(f"      {t:<6} {b:>9.4f} {l:>9.4f} {a:>8.4f}")
-    print(f"      共识 both_prec  = {cs['both_prec']:.4f}  (n={cs['both_n']})")
+    print(f"      consensus both_prec  = {cs['both_prec']:.4f}  (n={cs['both_n']})")
     print(f"      bert_only_prec  = {cs['bert_prec']:.4f}  (n={cs['bert_only_n']})")
     print(f"      llm_only_prec   = {cs['llm_prec']:.4f}  (n={cs['llm_only_n']})")
 
-    # 2) 搜索全局超参: consensus_bonus, consensus_th_mult, bert_only_factor, llm_only_factor
-    #    + vote_bonus_coef (5-beam 票数加成)
-    #    每种类型 α 按 F1 比例固定; 阈值按 (per-type) 网格搜
-    #    目标: F1 - 0.02 * |P - R|  (P/R 平衡, 防过拟合)
-    print("\n  [2] 全局超参网格搜索 (在验证集上, 目标 F1 - 0.02·|P-R|):")
+    # 2) Global hyperparameter search: consensus_bonus, consensus_th_mult,
+    #    bert_only_factor, llm_only_factor
+    #    + vote_bonus_coef (5-beam vote bonus)
+    #    α is fixed per type from the F1 ratio; thresholds are grid-searched
+    #    per type.
+    #    Objective: F1 - 0.02 * |P - R|  (P/R balance, anti-overfit)
+    print("\n  [2] Global hyperparameter grid search (on the validation set, "
+          "objective F1 - 0.02·|P-R|):")
     best = {'f1': 0.0, 'score': -1.0}
     type_alphas = {t: (bert_f1[t] / (bert_f1[t] + llm_f1[t])
                        if (bert_f1[t] + llm_f1[t]) > 0 else 0.5) for t in ALL_TYPES}
-    # 加速: 走 static_fusion_predict_metrics (fast 版, 直接给 tps/pns/tns)
-    # 搜参空间: bonus×mult×bf×lf×vbc×th, Step 1.5 已单独搜过 β→vbc, 此处固定 vbc=0 (最优),
-    #          bonus/bf/lf 收窄到经验有效范围 → 1080 次 (原 7200 次, 提速 6.7×)
+    # Speedup: use static_fusion_predict_metrics (fast, returns tps/pns/tns directly)
+    # Search space: bonus×mult×bf×lf×vbc×th. β→vbc was already searched in
+    # Step 1.5, so vbc=0 (best) is fixed here. bonus/bf/lf are narrowed to the
+    # empirically effective range → 1080 cells (was 7200, 6.7× speedup).
     _bonus_grid = [0.05, 0.15, 0.25]
     _mult_grid = [0.7, 0.85, 1.0]
     _bf_grid = [0.9, 1.0]
     _lf_grid = [0.7, 0.85, 1.0]
-    _vbc_grid = [0.00]  # Step 1.5 已搜过 β, 此处 vbc 固定 0
+    _vbc_grid = [0.00]  # β was already searched in Step 1.5, so vbc=0 is fixed
     _th_grid = [0.30, 0.35, 0.40, 0.45, 0.50]
     _total = len(_bonus_grid) * len(_mult_grid) * len(_bf_grid) * len(_lf_grid) * len(_vbc_grid) * len(_th_grid)
     _t0 = time.time()
@@ -1094,15 +1142,15 @@ def run_static_fusion(train_samples, test_samples):
                             if _cnt % 100 == 0 or _cnt == _total:
                                 _elapsed = time.time() - _t0
                                 _eta = _elapsed / _cnt * (_total - _cnt)
-                                print(f"      [进度] {_cnt}/{_total}  "
-                                      f"已用 {_elapsed:.1f}s, 预计剩余 {_eta:.1f}s, "
-                                      f"当前最优 F1={best['f1']:.4f}")
-    print(f"  -> 全局最佳: bonus={best['bonus']}, mult={best['mult']}, "
+                                print(f"      [Progress] {_cnt}/{_total}  "
+                                      f"elapsed {_elapsed:.1f}s, ETA {_eta:.1f}s, "
+                                      f"current best F1={best['f1']:.4f}")
+    print(f"  -> Global best: bonus={best['bonus']}, mult={best['mult']}, "
           f"bf={best['bf']}, lf={best['lf']}, th={best['th']}, "
           f"vbc={best['vbc']}, F1={best['f1']:.4f} (P={best['p']:.4f}, R={best['r']:.4f})")
 
-    # 3) per-type 阈值微调 (fast 版)
-    print("\n  [3] per-type 阈值微调:")
+    # 3) Per-type threshold refinement (fast)
+    print("\n  [3] Per-type threshold refinement:")
     best_type_th = {t: best['th'] for t in ALL_TYPES}
     for etype in ALL_TYPES:
         best_t, best_f_t = best['th'], 0.0
@@ -1120,8 +1168,8 @@ def run_static_fusion(train_samples, test_samples):
         best_type_th[etype] = best_t
         print(f"      {etype}: th={best_t:.2f}, F1={best_f_t:.4f}")
 
-    # 4) 验证集最终
-    print("\n  [4] 验证集最终结果:")
+    # 4) Final on the validation set
+    print("\n  [4] Final results on the validation set:")
     val_preds, val_labels = static_fusion_predict(
         train_samples, type_alphas, best_type_th,
         consensus_bonus=best['bonus'], consensus_th_mult=best['mult'],
@@ -1130,7 +1178,7 @@ def run_static_fusion(train_samples, test_samples):
     val_p, val_r, val_f1, val_tp, vp, vt = evaluate(val_preds, val_labels)
     print_metrics("Static-Weight (val)", val_p, val_r, val_f1, val_tp, vp, vt)
 
-    # 5) 测试集
+    # 5) Test set
     test_preds, test_labels = static_fusion_predict(
         test_samples, type_alphas, best_type_th,
         consensus_bonus=best['bonus'], consensus_th_mult=best['mult'],
@@ -1138,7 +1186,7 @@ def run_static_fusion(train_samples, test_samples):
         vote_bonus_coef=best['vbc'])
     test_p, test_r, test_f1, test_tp, tp_n, tt_n = evaluate(test_preds, test_labels)
     print_metrics("Static-Weight (test)", test_p, test_r, test_f1, test_tp, tp_n, tt_n)
-    # 返回 (F1_val, F1_test, type_alphas, type_thresholds, 超参 dict)
+    # Returns (F1_val, F1_test, type_alphas, type_thresholds, hyperparam dict)
     hyper = {
         'bonus': best['bonus'], 'mult': best['mult'],
         'bf': best['bf'], 'lf': best['lf'], 'vbc': best['vbc'],
@@ -1147,28 +1195,33 @@ def run_static_fusion(train_samples, test_samples):
 
 
 # ====================================================================
-# 5b. 策略 A'' (Vote-Aware 硬规则版): 把 beam 票数显式编入阈值
+# 5b. Strategy A'' (Vote-Aware Hard-Rule version): encode the beam vote
+# count explicitly into the threshold
 # ====================================================================
-# 在 A' 基础上增加两个全局参数:
-#   min_vote_both: 共识 (BERT+LLM 共同) 至少需要几 beam 同意
-#   min_vote_llm : 单独 LLM 至少需要几 beam 同意 (单独 LLM 容易幻觉, 默认要 5 票)
-# 直观解释:
-#   - 5 票单独 LLM = 5 个 beam 都猜这个实体, 但 BERT 没猜 → 可能是 LLM 学到而 BERT 没学到的
-#   - 1 票共识 = 1 个 beam 同意 + BERT 同意 → 弱信号, 可拒
-#   - 5 票共识 = 全员同意 → 强信号, 必留
+# On top of A', two global parameters are added:
+#   min_vote_both: minimum beams for consensus (BERT+LLM agree)
+#   min_vote_llm : minimum beams for LLM-only (LLM-only often hallucinates,
+#                  default requires 5 votes)
+# Intuition:
+#   - 5-vote LLM-only = all 5 beams predict it but BERT does not → maybe
+#                      the LLM learned something BERT missed
+#   - 1-vote consensus = 1 beam agrees + BERT agrees            → weak signal
+#   - 5-vote consensus = full agreement                          → strong signal
+
 
 def _make_uniform_type_th(con_th, b_th, l_th):
-    """生成 type_th dict: {type: (con_th, b_th, l_th)} 全部类型用同一组阈值。"""
+    """Build a type_th dict: {type: (con_th, b_th, l_th)}; all types share
+    the same threshold triple."""
     return {t: (con_th, b_th, l_th) for t in ALL_TYPES}
 
 
 def static_fusion_voteaware_predict(samples, type_th, min_vote_both=1, min_vote_llm=5):
-    """Vote-Aware 硬规则融合。
+    """Vote-Aware hard-rule fusion.
     type_th[t] = (con_th, b_th, l_th)
-    规则:
-        共识:        vote_count >= min_vote_both AND bert_conf >= con_th[t]
-        单独 BERT:   bert_conf >= b_th[t]
-        单独 LLM:    vote_count >= min_vote_llm  AND llm_conf  >= l_th[t]
+    Rules:
+        consensus:     vote_count >= min_vote_both AND bert_conf >= con_th[t]
+        BERT-only:     bert_conf >= b_th[t]
+        LLM-only:      vote_count >= min_vote_llm  AND llm_conf  >= l_th[t]
     """
     preds_list, labels_list = [], []
     for s in samples:
@@ -1195,22 +1248,23 @@ def static_fusion_voteaware_predict(samples, type_th, min_vote_both=1, min_vote_
 
 
 def run_static_fusion_voteaware(train_samples, test_samples):
-    """策略 A'': Vote-Aware Hard-Rule Static Fusion"""
+    """Strategy A'': Vote-Aware Hard-Rule Static Fusion."""
     print("\n" + "=" * 70)
-    print("【策略 A''】Vote-Aware Hard-Rule Static Fusion (硬规则 + 票数门)")
+    print("【Strategy A''】Vote-Aware Hard-Rule Static Fusion (hard rule + vote gate)")
     print("=" * 70)
-    print("思路: 在 A' 基础上把 beam 票数显式编入判定:")
-    print("      - 共识: vote_count >= min_vote_both AND bert_conf >= con_th")
-    print("      - 单独 LLM: vote_count >= min_vote_llm AND llm_conf >= l_th")
-    print("      单独 LLM 经常是幻觉, 默认要 5/5 票才考虑。")
+    print("Idea: on top of A', encode the beam vote count explicitly:")
+    print("      - consensus: vote_count >= min_vote_both AND bert_conf >= con_th")
+    print("      - LLM-only:  vote_count >= min_vote_llm  AND llm_conf  >= l_th")
+    print("      LLM-only is often hallucination, so default requires 5/5 votes.")
     print("-" * 70)
 
-    # 1) 全局网格: min_vote_both (共识最少票) × min_vote_llm (单独 LLM 最少票)
-    #            × bsolo (BERT solo 阈值) × lsolo (LLM solo 阈值, con=0 固定)
-    print("  [1] 全局网格 (min_vote_both × min_vote_llm × bsolo × lsolo):")
+    # 1) Global grid: min_vote_both (min votes for consensus) × min_vote_llm
+    #    (min votes for LLM-only) × bsolo (BERT solo threshold) × lsolo
+    #    (LLM solo threshold, con=0 fixed)
+    print("  [1] Global grid (min_vote_both × min_vote_llm × bsolo × lsolo):")
     best = {'f1': 0.0}
-    for mvb in [1, 2, 3, 4, 5]:                       # 共识最少票
-        for mvl in [3, 4, 5]:                         # 单独 LLM 最少票
+    for mvb in [1, 2, 3, 4, 5]:                       # min votes for consensus
+        for mvl in [3, 4, 5]:                         # min votes for LLM-only
             for bsolo in [0.80, 0.85, 0.90, 0.95]:
                 for lsolo in [0.80, 0.85, 0.90, 0.95]:
                     type_th = _make_uniform_type_th(0.0, bsolo, lsolo)
@@ -1220,11 +1274,12 @@ def run_static_fusion_voteaware(train_samples, test_samples):
                     if f1 > best['f1']:
                         best = {'f1': f1, 'mvb': mvb, 'mvl': mvl,
                                 'bsolo': bsolo, 'lsolo': lsolo}
-    print(f"  -> 全局最佳: min_vote_both={best['mvb']}, min_vote_llm={best['mvl']}, "
+    print(f"  -> Global best: min_vote_both={best['mvb']}, min_vote_llm={best['mvl']}, "
           f"bsolo={best['bsolo']}, lsolo={best['lsolo']}, F1={best['f1']:.4f}")
 
-    # 2) per-type consensus_th 微调 (影响最大, 单独阈值共用全局值)
-    print("\n  [2] per-type consensus_th 微调:")
+    # 2) Per-type consensus_th refinement (it has the most impact; the
+    #    shared solo thresholds keep the global value)
+    print("\n  [2] Per-type consensus_th refinement:")
     type_th = _make_uniform_type_th(0.0, best['bsolo'], best['lsolo'])
     for etype in ALL_TYPES:
         best_con, best_f_t = 0.0, 0.0
@@ -1239,8 +1294,8 @@ def run_static_fusion_voteaware(train_samples, test_samples):
         type_th[etype] = (best_con, best['bsolo'], best['lsolo'])
         print(f"      {etype}: con_th={best_con:.2f}, F1={best_f_t:.4f}")
 
-    # 3) per-type 单独阈值微调 (围绕全局值)
-    print("\n  [3] per-type bert_solo_th / llm_solo_th 微调:")
+    # 3) Per-type solo threshold refinement (around the global value)
+    print("\n  [3] Per-type bert_solo_th / llm_solo_th refinement:")
     for etype in ALL_TYPES:
         cur_con, _, _ = type_th[etype]
         best_b, best_l, best_f_t = best['bsolo'], best['lsolo'], 0.0
@@ -1258,8 +1313,8 @@ def run_static_fusion_voteaware(train_samples, test_samples):
         type_th[etype] = (cur_con, best_b, best_l)
         print(f"      {etype}: con={cur_con:.2f}, bsolo={best_b:.2f}, lsolo={best_l:.2f}, F1={best_f_t:.4f}")
 
-    # 4) per-type 二次 min_vote 调优 (围绕全局)
-    print("\n  [4] per-type min_vote_both 微调 (单独 LLM 票数共用全局):")
+    # 4) Per-type min_vote_both refinement (around the global)
+    print("\n  [4] Per-type min_vote_both refinement (LLM-only votes share the global):")
     for etype in ALL_TYPES:
         cur_con, cur_b, cur_l = type_th[etype]
         best_mvb, best_f_t = best['mvb'], 0.0
@@ -1272,20 +1327,21 @@ def run_static_fusion_voteaware(train_samples, test_samples):
             if f1 > best_f_t:
                 best_f_t, best_mvb = f1, mvb
         type_th[etype] = (cur_con, cur_b, cur_l)
-        # 注意: 实际 min_vote_both 是全局的, 此处只是验证全局值的稳定性
-    # 全部类型共用最佳 mvb / mvl
+        # Note: min_vote_both is global at inference; this loop only verifies
+        # the global value's stability across types.
+    # All types use the best global mvb / mvl
     mvb_final = best['mvb']
     mvl_final = best['mvl']
-    print(f"      全部类型使用全局: min_vote_both={mvb_final}, min_vote_llm={mvl_final}")
+    print(f"      All types use the global: min_vote_both={mvb_final}, min_vote_llm={mvl_final}")
 
-    # 5) 验证集
-    print("\n  [5] 验证集最终结果:")
+    # 5) Validation
+    print("\n  [5] Final results on the validation set:")
     val_preds, val_labels = static_fusion_voteaware_predict(
         train_samples, type_th, mvb_final, mvl_final)
     val_p, val_r, val_f1, val_tp, vp, vt = evaluate(val_preds, val_labels)
     print_metrics("Vote-Aware Hard-Rule (val)", val_p, val_r, val_f1, val_tp, vp, vt)
 
-    # 6) 测试集
+    # 6) Test
     test_preds, test_labels = static_fusion_voteaware_predict(
         test_samples, type_th, mvb_final, mvl_final)
     test_p, test_r, test_f1, test_tp, tp_n, tt_n = evaluate(test_preds, test_labels)
@@ -1294,30 +1350,41 @@ def run_static_fusion_voteaware(train_samples, test_samples):
 
 
 # ====================================================================
-# 6. 策略B: 门控网络融合 (Gating Network Fusion)
-#   - 网络输出 (w_bert, w_llm) 两路 sigmoid 权重
-#   - 融合分 = w_bert * bert_conf + w_llm * llm_conf + consensus_bonus * both_present
-#   - 训练目标: 让"实体正确"时 combined_score 大, 错误时小 (BCE on combined)
-#   - 共识特征 (both_present) 进入网络, 也作为预测时显式加成
-#   - 网络会自动学会: 共识 → w_b + w_l 都高; 单独 → 偏向高置信度的那一侧
+# 6. Strategy B: Gating Network Fusion
+#   - The network outputs two sigmoid weights (w_bert, w_llm).
+#   - Combined score = w_bert * bert_conf + w_llm * llm_conf +
+#                      consensus_bonus * both_present
+#   - Training objective: push the combined score up when the entity is
+#     correct, down otherwise (BCE on the combined score).
+#   - The consensus feature (both_present) is fed to the network and is
+#     also used as an explicit bonus at inference.
+#   - The network learns: consensus  → both w_b and w_l high;
+#                         single      → lean toward the high-confidence side.
 # ====================================================================
 
 class GatingNetwork(nn.Module):
-    """输出两路权重 (w_bert, w_llm), 网络可学习"何时信任谁"
-    n_feats: 输入特征数。完整=16 (含 5-beam 特有 4 个), drop_beam=12 (只用通用特征)
+    """Outputs two weights (w_bert, w_llm); the network learns "when to trust
+    whom".
 
-    架构分两种:
-      - 5b 模式 (n_feats=16): 2×hidden=64 + 3 头 (w_bert/w_llm/bonus) — 与原版一致
-      - b1 模式 (n_feats=12): 1×hidden=32 + 1 头, 直接输出单 logit — 对齐 gating_network_dp_mark_v3.py
-                              配合 BCE + 0.15*MSE(calibrated_target) 蒸馏损失, 缓解 val/test 过拟合
+    n_feats: number of input features. Full = 16 (including 4 beam-specific
+             ones); drop_beam = 12 (only generic features).
+
+    Two architectures:
+      - 5b mode (n_feats=16): 2×hidden=64 + 3 heads (w_bert / w_llm / bonus)
+                              — same as the original
+      - b1 mode (n_feats=12): 1×hidden=32 + 1 head that outputs a single logit
+                              — aligned with gating_network_dp_mark_v3.py
+                              Combined with BCE + 0.15 * MSE(calibrated_target)
+                              distillation loss to mitigate val/test overfit.
     """
     def __init__(self, num_types=NUM_TYPES, type_emb_dim=8, hidden_dim=64, n_feats=16):
         super().__init__()
         self.n_feats = n_feats
-        self.drop_beam_features = (n_feats == 12)  # 模型自己记住, 推理时 gating_predict 会读
+        self.drop_beam_features = (n_feats == 12)  # remembered for gating_predict
         self.type_emb = nn.Embedding(num_types, type_emb_dim)
         if n_feats == 12:
-            # b1 模式: 小容量 + 单头, 避免在 Beam-1 小样本上过拟合
+            # b1 mode: small capacity + single head, to avoid overfit on the
+            # small Beam-1 sample
             self.trunk = nn.Sequential(
                 nn.Linear(12 + type_emb_dim, 32),
                 nn.BatchNorm1d(32),
@@ -1326,7 +1393,7 @@ class GatingNetwork(nn.Module):
             )
             self.head_score = nn.Linear(32, 1)
         else:
-            # 5b 模式: 完整 3 头, 与原版一致
+            # 5b mode: full 3 heads, same as the original
             in_dim = n_feats + type_emb_dim
             self.trunk = nn.Sequential(
                 nn.Linear(in_dim, hidden_dim),
@@ -1338,20 +1405,20 @@ class GatingNetwork(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(0.2),
             )
-            # 头1: 输出 w_bert
+            # head 1: w_bert
             self.head_wb = nn.Linear(hidden_dim, 1)
-            # 头2: 输出 w_llm
+            # head 2: w_llm
             self.head_wl = nn.Linear(hidden_dim, 1)
-            # 头3: 共识加成 (sigmoid 输出后乘以 both_pres)
+            # head 3: consensus bonus (sigmoid output multiplied by both_pres)
             self.head_bonus = nn.Linear(hidden_dim, 1)
 
     def forward(self, llm_conf, bert_conf, llm_pres, bert_pres,
                 conf_diff, both_pres, llm_only, bert_only,
                 n_cands, bert_rank, llm_rank, static_score,
                 type_ids, *beam_feats):
-        """参数顺序: 12 base + type_ids + N beam_feats (0 或 4)
-        完整模式 (drop=False): beam_feats 收到 4 个 tensor
-        drop 模式 (drop=True):  beam_feats 是空 tuple, 跳过
+        """Argument order: 12 base + type_ids + N beam_feats (0 or 4)
+        Full mode (drop=False): beam_feats receives 4 tensors
+        Drop mode (drop=True):  beam_feats is an empty tuple and is skipped
         """
         type_e = self.type_emb(type_ids)
         base = [llm_conf, bert_conf, llm_pres, bert_pres,
@@ -1361,9 +1428,9 @@ class GatingNetwork(nn.Module):
         x = torch.cat([x, type_e], dim=1)
         h = self.trunk(x)
         if self.n_feats == 12:
-            # b1 模式: 直接返回单 logit (配合 sigmoid 得 0~1 分)
+            # b1 mode: directly return a single logit (sigmoid → 0..1 score)
             return self.head_score(h).squeeze(-1)
-        # 5b 模式: 3 头
+        # 5b mode: 3 heads
         w_bert_logit = self.head_wb(h).squeeze(-1)
         w_llm_logit  = self.head_wl(h).squeeze(-1)
         bonus_logit  = self.head_bonus(h).squeeze(-1)
@@ -1371,9 +1438,12 @@ class GatingNetwork(nn.Module):
 
 
 def _candidates_to_features(samples, drop_beam_features=False):
-    """把 samples 拆成 (cand_features, type_ids, group_ids, labels) 列表
-    drop_beam_features=True:  不喂 5-beam 特有特征 (vote_count/llm_avg_conf/llm_max_conf/best_beam_idx),
-                              强制门控网络只用通用特征 (B_b1 消融用)。
+    """Split samples into (cand_features, type_ids, group_ids, labels) lists.
+    drop_beam_features=True: do NOT feed the 5-beam-specific features
+                             (vote_count / llm_avg_conf / llm_max_conf /
+                             best_beam_idx); force the gating network to use
+                             only the generic features (used by the B_b1
+                             ablation).
     """
     feats, type_ids, group_ids, labels = [], [], [], []
     for gi, s in enumerate(samples):
@@ -1393,8 +1463,10 @@ def _candidates_to_features(samples, drop_beam_features=False):
                 continue
             k = (c['start_idx'], c['entity'], t)
             if drop_beam_features:
-                # B_b1 消融: 完全不喂 5-beam 特有特征, 强制只用通用特征
-                # 多算 calibrated_target (0.5*llm + 0.5*bert) 给蒸馏损失用 — 对齐 v3
+                # B_b1 ablation: do NOT feed the 5-beam-specific features at
+                # all; force the use of generic features only.
+                # Also compute calibrated_target (0.5*llm + 0.5*bert) for the
+                # distillation loss — aligned with v3.
                 feat = {
                     'llm_conf': c['llm_conf'], 'bert_conf': c['bert_conf'],
                     'llm_present': float(c['llm_present']), 'bert_present': float(c['bert_present']),
@@ -1410,7 +1482,7 @@ def _candidates_to_features(samples, drop_beam_features=False):
                     'type_id': TYPE2IDX[t],
                 }
             else:
-                # 候选若有 beam 特征则取, 否则填默认值 (0.0 = 单 beam 视角)
+                # Use the beam features if available; default to 0.0 (single-beam view)
                 vc = float(c.get('vote_count', 0.0))
                 la = float(c.get('llm_avg_conf', 0.0))
                 lm = float(c.get('llm_max_conf', 0.0))
@@ -1439,17 +1511,19 @@ def _candidates_to_features(samples, drop_beam_features=False):
 
 
 def _to_tensors(feats, type_ids, group_ids, labels, drop_beam_features=False):
-    """返回顺序: 12 base + type_ids + (4 beam?) + group_ids + (calib?) + label
-    完整模式 (drop=False): 12 + 1 + 4 + 1 + 0 + 1 = 19 个
-    drop 模式 (drop=True):   12 + 1 + 0 + 1 + 1 + 1 = 16 个  (calib=0.5*llm+0.5*bert 给蒸馏用)
-    forward 签名: 12 base + type_ids + 4 beam (顺序一一对应, model(*xs) 用位置参数传)
+    """Return order: 12 base + type_ids + (4 beam?) + group_ids + (calib?) + label
+    Full mode  (drop=False): 12 + 1 + 4 + 1 + 0 + 1 = 19 tensors
+    Drop mode   (drop=True):  12 + 1 + 0 + 1 + 1 + 1 = 16 tensors
+                              (calib=0.5*llm+0.5*bert is fed for distillation)
+    forward signature: 12 base + type_ids + 4 beam (positional, so model(*xs)
+    must receive them in the same order).
     """
     if not feats:
         n_base = 12
         n_beam = 0 if drop_beam_features else 4
         empty_f = torch.empty(0, dtype=torch.float32)
         empty_l = torch.empty(0, dtype=torch.long)
-        # 顺序: n_base 个 float + 1 long (type) + n_beam 个 float + 1 long (group) + (1 float calib) + 1 float (label)
+        # Tensor order: n_base floats + 1 long (type) + n_beam floats + 1 long (group) + (1 float calib) + 1 float (label)
         out = ((empty_f,) * n_base + (empty_l,)
                + (empty_f,) * n_beam + (empty_l,))
         if drop_beam_features:
@@ -1461,12 +1535,13 @@ def _to_tensors(feats, type_ids, group_ids, labels, drop_beam_features=False):
                  'n_cands', 'bert_rank', 'llm_rank', 'static_score']
     beam_keys = ['vote_count', 'llm_avg_conf', 'llm_max_conf', 'best_beam_idx']
     tensors = [torch.tensor([f[k] for f in feats], dtype=torch.float32) for k in base_keys]
-    tensors.append(torch.tensor(type_ids, dtype=torch.long))   # type_ids 紧跟 12 base 之后
+    tensors.append(torch.tensor(type_ids, dtype=torch.long))   # type_ids immediately after 12 base
     if not drop_beam_features:
         tensors += [torch.tensor([f[k] for f in feats], dtype=torch.float32) for k in beam_keys]
     tensors.append(torch.tensor(group_ids, dtype=torch.long))
     if drop_beam_features:
-        # b1 模式: 追加 calibrated_target (蒸馏软标签), 在 group 之后 label 之前
+        # b1 mode: append calibrated_target (distillation soft label), between
+        # group and label
         tensors.append(torch.tensor([f['calibrated_target'] for f in feats], dtype=torch.float32))
     tensors.append(torch.tensor(labels, dtype=torch.float32))
     return tuple(tensors)
@@ -1488,11 +1563,12 @@ def _grouped_ranking_loss(scores, labels, group_ids, margin=0.05):
 
 
 def _gating_combined(w_bert, w_llm, bonus_logit, bert_conf, llm_conf, both_pres):
-    """把网络 logits 拼成标量 '实体正确分' (用于训练和预测)"""
+    """Combine the network logits into a scalar "entity-correctness score"
+    (used for training and inference)."""
     wb = torch.sigmoid(w_bert)
     wl = torch.sigmoid(w_llm)
     b  = torch.sigmoid(bonus_logit)
-    # 共识加成只在 both_present=1 时生效
+    # Consensus bonus only takes effect when both_present=1
     bonus_term = b * both_pres * 0.30
     return wb * bert_conf + wl * llm_conf + bonus_term, wb, wl, b
 
@@ -1500,22 +1576,26 @@ def _gating_combined(w_bert, w_llm, bonus_logit, bert_conf, llm_conf, both_pres)
 def _bce_loss_with_ranking(combined, labels, group_ids, margin=0.05):
     bce = nn.functional.binary_cross_entropy_with_logits(combined, labels)
     rank = _grouped_ranking_loss(combined, labels, group_ids, margin=margin)
-    # ranking 主导 (0.3), BCE 辅助 (1.0) → 缓解保守阈值
+    # Ranking is dominant (0.3); BCE is auxiliary (1.0) — mitigates a
+    # too-conservative threshold
     return bce + 0.3 * rank
 
 
 def train_gating(model, train_loader, valid_loader, epochs=50, lr=2e-3, patience=10,
                  save_dir='saved_models_clean', model_tag='5b'):
-    """训练门控网络; 评估指标用 combined 的 BCE + ranking
-    model_tag:  '5b' (5-beam 特征, 16 维) 或 'b1' (Beam-1 only, 12 维) — 决定 best 模型文件名
-                避免两个消融共用同一文件名互相覆盖
-    b1 模式: lr=5e-4 / wd=1e-3 / patience=15, 损失 = BCE + 0.15·MSE(calibrated_target)
-             对齐 gating_network_dp_mark_v3.py
+    """Train the gating network; loss is BCE + ranking on the combined score.
+    model_tag: '5b' (5-beam features, 16-d) or 'b1' (Beam-1 only, 12-d) — this
+               only decides the saved best-model filename, to keep the two
+               ablations from overwriting each other.
+    b1 mode: lr=5e-4 / wd=1e-3 / patience=15; loss = BCE + 0.15·MSE(calibrated_target)
+             (aligned with gating_network_dp_mark_v3.py).
     """
     os.makedirs(save_dir, exist_ok=True)
     is_b1 = (model_tag == 'b1')
-    # b1 模式用更稳的超参 (小 lr + 小 wd + 长 patience) — 与 v3 一致
-    # 注: b1 的 lr 来自调用方传参 (caller 显式传 5e-4), wd/patience 强制覆盖, 避免老 caller 传 5 时被忽略
+    # b1 mode uses more conservative hyperparameters (small lr + small wd +
+    # long patience) — matches v3
+    # Note: b1's lr is supplied by the caller (explicit 5e-4); wd/patience are
+    # forced here so that old callers that pass 5 are not silently ignored.
     if is_b1:
         if lr is None:
             lr = 5e-4
@@ -1528,16 +1608,16 @@ def train_gating(model, train_loader, valid_loader, epochs=50, lr=2e-3, patience
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     best_val_loss, trigger = float('inf'), 0
-    # 按 model_tag 区分: 5b / b1 各存一份, 避免互相覆盖
+    # One file per model_tag: 5b / b1 are saved separately to avoid overwrite
     best_path = os.path.join(save_dir, f'best_gating_{model_tag}.pth')
     for ep in range(1, epochs + 1):
         model.train()
         total = 0
         if is_b1:
-            # b1 loader 格式: *xs, gid, calib, y
+            # b1 loader layout: *xs, gid, calib, y
             for *xs, gid, calib, y in train_loader:
                 optimizer.zero_grad()
-                score_logit = model(*xs)            # 单 logit
+                score_logit = model(*xs)            # single logit
                 prob = torch.sigmoid(score_logit)
                 bce = nn.functional.binary_cross_entropy_with_logits(score_logit, y)
                 mse = nn.functional.mse_loss(prob, calib)
@@ -1547,7 +1627,7 @@ def train_gating(model, train_loader, valid_loader, epochs=50, lr=2e-3, patience
                 optimizer.step()
                 total += loss.item()
         else:
-            # 5b loader 格式: *xs, gid, y
+            # 5b loader layout: *xs, gid, y
             for *xs, gid, y in train_loader:
                 optimizer.zero_grad()
                 wb_log, wl_log, bonus_log = model(*xs)
@@ -1595,14 +1675,16 @@ def train_gating(model, train_loader, valid_loader, epochs=50, lr=2e-3, patience
     return model
 
 def gating_predict(samples, model, threshold):
-    """用训练好的门控网络预测。
-    分数 = sigmoid(w_bert)*bert_conf + sigmoid(w_llm)*llm_conf + sigmoid(bonus)*both_pres*0.30
-    threshold: float (全局) 或 {type: float} (per-type)
-    注: model.drop_beam_features (训练时设置) 决定推理时是否 drop 5-beam 特征
+    """Predict with the trained gating network.
+    score = sigmoid(w_bert)*bert_conf + sigmoid(w_llm)*llm_conf + sigmoid(bonus)*both_pres*0.30
+    threshold: float (global) or {type: float} (per-type)
+    Note: model.drop_beam_features (set at training time) determines whether
+    to drop the 5-beam features at inference.
     """
     drop = getattr(model, 'drop_beam_features', False)
     model.eval()
-    # 一次批量推理 → 拿所有样本的所有候选分数, 避免循环里逐样本调 model
+    # One batched inference for all samples' candidates, avoiding per-sample
+    # calls in the loop
     scores_per_sample = _gating_batch_scores(samples, model, drop)
     preds_list, labels_list = [], []
     for s, sc in zip(samples, scores_per_sample):
@@ -1623,11 +1705,14 @@ def gating_predict(samples, model, threshold):
 
 
 def _gating_batch_scores(samples, model, drop):
-    """一次性算出 samples 中所有候选的 combined score (向量化推理)。
-    返回: list[np.array], 第 s 个数组是 samples[s] 的所有候选的 score。
-    网格搜索时复用: 1 次批量推理, N 次阈值扫描 (N=40 全局 + 90 per-type)。
-    b1 模式: model 输出单 logit, 得分 = sigmoid(logit)
-    5b 模式: model 输出 3 头, 得分 = wb*bert + wl*llm + bonus*both*0.30
+    """Compute the combined score for every candidate across all samples in a
+    single forward pass (vectorized inference).
+    Returns: list[np.array] — the s-th array contains the scores of all
+    candidates of samples[s].
+    Reused by the grid search: 1 batched inference + N threshold sweeps
+    (N=40 global + 90 per-type).
+    b1 mode: model outputs a single logit; score = sigmoid(logit)
+    5b mode: model outputs 3 heads; score = wb*bert + wl*llm + bonus*both*0.30
     """
     all_feats, all_tids, boundaries = [], [], []
     for s in samples:
@@ -1638,8 +1723,8 @@ def _gating_batch_scores(samples, model, drop):
         boundaries.append((start, len(all_feats)))
     if not all_feats:
         return [np.array([], dtype=np.float32) for _ in samples]
-    # 末尾 2 元素是 (gid, label) 或 3 元素 (gid, calib, label), 但本函数只喂 0 标签, 与训练 loader 不一致
-    # 这里直接重新 build 一个无 label 的张量组, 避免歧义
+    # The last 2 elements (or 3 in b1) are (gid, label) or (gid, calib, label).
+    # Here we rebuild the tensor list with dummy labels to avoid ambiguity.
     n_base = 12
     n_beam = 0 if drop else 4
     base_keys = ['llm_conf', 'bert_conf', 'llm_present', 'bert_present',
@@ -1653,10 +1738,10 @@ def _gating_batch_scores(samples, model, drop):
     with torch.no_grad():
         out = model(*x)
         if model.n_feats == 12:
-            # b1 模式: 单 logit → sigmoid
+            # b1 mode: single logit → sigmoid
             scores = torch.sigmoid(out).cpu().numpy()
         else:
-            # 5b 模式: 3 头 → combined
+            # 5b mode: 3 heads → combined
             wb_log, wl_log, bonus_log = out
             combined, _, _, _ = _gating_combined(wb_log, wl_log, bonus_log, x[1], x[0], x[5])
             scores = combined.cpu().numpy()
@@ -1665,8 +1750,9 @@ def _gating_batch_scores(samples, model, drop):
 
 
 def _filter_by_threshold(samples, scores_per_sample, threshold):
-    """基于预计算的 scores 按阈值筛选 (per-type th dict 或全局 float)。
-    与 gating_predict 输出格式一致的纯 Python 循环, 但不调 model。
+    """Filter by threshold (per-type dict or global float) on precomputed
+    scores. Pure-Python loop that matches `gating_predict`'s output format,
+    but does not call the model.
     """
     preds_list, labels_list = [], []
     for s, sc in zip(samples, scores_per_sample):
@@ -1687,39 +1773,44 @@ def _filter_by_threshold(samples, scores_per_sample, threshold):
 
 
 # ====================================================================
-# 5c. 策略 A_v2: Consensus V2 Hard-Rule
+# 5c. Strategy A_v2: Consensus V2 Hard-Rule
 # ====================================================================
-# 共识细分 (per-beam 特征)
-#   共识强: best_beam_idx=0 (beam 1 也预测了) + vote >= 4  → 必留
-#   共识弱: best_beam_idx >= 3 (仅 beam 4-5 预测)           → 加 bert_conf 阈值
-#   共识中: 默认                                              → 必留
+# Granular consensus (per-beam features):
+#   Strong consensus: best_beam_idx=0 (beam 1 also predicted) + vote >= 4
+#                     → always keep
+#   Weak consensus:   best_beam_idx >= 3 (only beams 4-5 predicted)
+#                     → require an additional bert_conf threshold
+#   Mid consensus:    default                                    → always keep
 #
-#   单独 LLM: vote >= 5  AND  max_beam_conf >= th_llm
-#                          AND  (max-min) <= 0.30   ← conf 分散度约束
-# 输入参数 (per-type):
-#   bsolo_th[type]         单独 BERT bert_conf 阈值
-#   lsolo_th[type]         单独 LLM max_beam_conf 阈值
-#   lsolo_min_vote[type]   单独 LLM 最小票数 (默认 5)
-#   lsolo_max_spread[type] 单独 LLM conf 分散度上限 (默认 0.30)
+#   LLM-only:   vote >= 5  AND  max_beam_conf >= th_llm
+#                          AND  (max-min) <= 0.30   ← conf-spread constraint
+#
+# Input parameters (per-type):
+#   bsolo_th[type]          BERT-only bert_conf threshold
+#   lsolo_th[type]          LLM-only max_beam_conf threshold
+#   lsolo_min_vote[type]    LLM-only minimum vote count (default 5)
+#   lsolo_max_spread[type]  LLM-only conf-spread upper bound (default 0.30)
 def _a_v2_accept(c, bsolo, lsolo, lsolo_min_vote, lsolo_max_spread):
-    """单个候选是否被 A_v2 接受 (基于 per-beam 投票 + conf 分散度)。
-    接收的是 per-type 阈值字典与 c 候选, 返回 True/False。
+    """Whether a single candidate is accepted by A_v2 (based on per-beam
+    vote + conf spread). Takes per-type threshold dicts and a candidate;
+    returns True/False.
     """
     t = c['type']
     if c['bert_present'] and c['llm_present']:
-        # === 共识 (BERT+LLM 都预测了) ===
-        # 弱共识: 仅 beam 4-5 预测, BERT 把握也小 → 需 bert_conf ≥ 0.50
-        # 中/强共识: 必留
+        # === Consensus (BERT+LLM both predicted) ===
+        # Weak consensus: only beams 4-5 predicted, BERT confidence is also
+        # low → require bert_conf >= 0.50
+        # Mid/strong consensus: always keep
         best_bi = c.get('best_beam_idx', 0)
         if best_bi >= 3:
             return c['bert_conf'] >= 0.50
         return True
     if c['bert_present'] and not c['llm_present']:
-        # === 单独 BERT ===
+        # === BERT-only ===
         return c['bert_conf'] >= bsolo.get(t, 0.95)
     if c['llm_present'] and not c['bert_present']:
-        # === 单独 LLM ===
-        # 投票数 + conf 分散度
+        # === LLM-only ===
+        # Vote count + conf spread
         vote = c.get('vote_count', 0)
         if vote < lsolo_min_vote.get(t, 5):
             return False
@@ -1734,10 +1825,10 @@ def _a_v2_accept(c, bsolo, lsolo, lsolo_min_vote, lsolo_max_spread):
 
 def a_v2_predict(samples, bsolo_th, lsolo_th,
                  lsolo_min_vote=None, lsolo_max_spread=None):
-    """A_v2 预测: per-beam 投票 + conf 分散度 + 共识细分。
+    """A_v2 prediction: per-beam vote + conf spread + granular consensus.
     bsolo_th / lsolo_th : {type: float}
-    lsolo_min_vote      : {type: int}    (默认 5)
-    lsolo_max_spread    : {type: float}  (默认 0.30)
+    lsolo_min_vote      : {type: int}    (default 5)
+    lsolo_max_spread    : {type: float}  (default 0.30)
     """
     if lsolo_min_vote is None:
         lsolo_min_vote = {t: 5 for t in ALL_TYPES}
@@ -1756,22 +1847,22 @@ def a_v2_predict(samples, bsolo_th, lsolo_th,
 
 
 # ====================================================================
-# 策略 A_v2 训练/调用入口
+# Strategy A_v2 training / entry point
 # ====================================================================
 def run_a_v2(train_samples, test_samples):
-    """A_v2: Consensus V2 Hard-Rule 融合。
-    流程:
-      [1] 全局搜索 bsolo / lsolo / lsolo_min_vote / lsolo_max_spread
-      [2] per-type 微调 (范围受限, 防过拟合)
-      [3] 输出 val / test F1
+    """A_v2: Consensus V2 Hard-Rule Fusion.
+    Pipeline:
+      [1] Global search: bsolo / lsolo / lsolo_min_vote / lsolo_max_spread
+      [2] Per-type refinement (narrowed range, anti-overfit)
+      [3] Output val / test F1
     """
     print("\n" + "=" * 70)
-    print("【策略 A_v2】Consensus V2")
+    print("【Strategy A_v2】Consensus V2")
     print("=" * 70)
-    print("共识细分 (bi≥3 加 bert_conf) + 单独 LLM 加 conf 分散度约束")
+    print("Granular consensus (bi>=3 adds bert_conf) + LLM-only conf-spread constraint")
     print("-" * 70)
 
-    # [1] 诊断: 共识中/强 vs 弱
+    # [1] Diagnosis: mid/strong vs weak consensus
     both_n = both_hit = 0
     both_weak_n = both_weak_hit = 0
     for s in train_samples:
@@ -1784,12 +1875,12 @@ def run_a_v2(train_samples, test_samples):
                 if c.get('best_beam_idx', 0) >= 3:
                     both_weak_n += 1
                     if k in lset: both_weak_hit += 1
-    print(f"  [1] 共识诊断 (train):")
-    print(f"      共识全部:    n={both_n:5d}  hit={both_hit:5d}  prec={both_hit/both_n:.4f}")
-    print(f"      共识弱 (bi>=3): n={both_weak_n:5d}  hit={both_weak_hit:5d}  prec={both_weak_hit/max(1,both_weak_n):.4f}")
+    print(f"  [1] Consensus diagnosis (train):")
+    print(f"      All consensus:    n={both_n:5d}  hit={both_hit:5d}  prec={both_hit/both_n:.4f}")
+    print(f"      Weak consensus (bi>=3): n={both_weak_n:5d}  hit={both_weak_hit:5d}  prec={both_weak_hit/max(1,both_weak_n):.4f}")
 
-    # [2] 全局超参网格搜索
-    print(f"\n  [2] 全局网格搜索 (bsolo, lsolo, min_vote, max_spread):")
+    # [2] Global hyperparameter grid search
+    print(f"\n  [2] Global grid search (bsolo, lsolo, min_vote, max_spread):")
     best_f1, best_cfg = 0.0, None
     for bsolo_try in [0.90, 0.95]:
         for lsolo_try in [0.60, 0.70, 0.80, 0.85, 0.90]:
@@ -1804,11 +1895,11 @@ def run_a_v2(train_samples, test_samples):
                     if f1 > best_f1:
                         best_f1, best_cfg = f1, (bsolo_try, lsolo_try, mv_try, sp_try)
     bsolo, lsolo, mv, sp = best_cfg
-    print(f"  -> 全局最佳: bsolo={bsolo}, lsolo={lsolo}, min_vote={mv}, max_spread={sp}, "
+    print(f"  -> Global best: bsolo={bsolo}, lsolo={lsolo}, min_vote={mv}, max_spread={sp}, "
           f"F1={best_f1:.4f}")
 
-    # [3] per-type 微调 (范围小, 防过拟合)
-    print(f"\n  [3] per-type lsolo 微调:")
+    # [3] Per-type refinement (narrow range, anti-overfit)
+    print(f"\n  [3] Per-type lsolo refinement:")
     bsolo_th = {t: bsolo for t in ALL_TYPES}
     lsolo_th = {t: lsolo for t in ALL_TYPES}
     mv_th = {t: mv for t in ALL_TYPES}
@@ -1827,7 +1918,7 @@ def run_a_v2(train_samples, test_samples):
     print(f"  -> per-type lsolo: {lsolo_th}")
     print(f"     val F1 = {cur_f1:.4f}")
 
-    print(f"\n  [4] per-type bsolo 微调:")
+    print(f"\n  [4] Per-type bsolo refinement:")
     cur_f1_x = cur_f1
     for t in ALL_TYPES:
         best_b, best_v = bsolo, cur_f1_x
@@ -1842,12 +1933,12 @@ def run_a_v2(train_samples, test_samples):
     print(f"  -> per-type bsolo: {bsolo_th}")
     print(f"     val F1 = {cur_f1_x:.4f}")
 
-    # [5] 输出最终结果
+    # [5] Output final results
     val_preds, val_labels = a_v2_predict(train_samples, bsolo_th, lsolo_th, mv_th, sp_th)
     test_preds, test_labels = a_v2_predict(test_samples, bsolo_th, lsolo_th, mv_th, sp_th)
     _, _, val_f1, val_tp, val_pred_n, val_true_n = evaluate(val_preds, val_labels)
     _, _, test_f1, test_tp, test_pred_n, test_true_n = evaluate(test_preds, test_labels)
-    print(f"\n  [5] 验证集最终结果:")
+    print(f"\n  [5] Final results on the validation set:")
     print_metrics("A_v2_refined (val)", *evaluate(val_preds, val_labels)[:3],
                   tp=val_tp, tp_pred=val_pred_n, tp_true=val_true_n)
     print_metrics("A_v2_refined (test)", *evaluate(test_preds, test_labels)[:3],
@@ -1861,16 +1952,18 @@ def run_a_v2(train_samples, test_samples):
 
 
 # ====================================================================
-# 5d. 策略 A_cal: Calibrated Weighted Fusion (校准 + per-type α 加权)
+# 5d. Strategy A_cal: Calibrated Weighted Fusion (calibration + per-type α weighting)
 # ====================================================================
 def _fit_isotonic_calibrators(samples):
-    """在 samples 上拟合 BERT / LLM conf 的 isotonic 校准器。
-    输入: samples (list of {'candidates': [...], 'label_set': set(...)})
-    返回: (bert_cal, llm_cal, n_bert, n_llm, n_bert_pos, n_llm_pos)
-    校准器: cal.predict([x]) → P(正确|x), 0 ≤ y ≤ 1
-    防呆: 若样本全部同一类 (正/负 例率 = 100% 或 = 0%), sklearn IsotonicRegression
-          会因为只看到单 class 而报 "y must be at least two classes",
-          此时 cal.f_ 仍为 None, 上层 predict 走 fast-path 不校准, 不会崩。
+    """Fit isotonic calibrators for BERT / LLM conf on `samples`.
+    Input: samples (list of {'candidates': [...], 'label_set': set(...)})
+    Returns: (bert_cal, llm_cal, n_bert, n_llm, n_bert_pos, n_llm_pos)
+    Calibrators: cal.predict([x]) → P(correct|x), 0 ≤ y ≤ 1
+    Guard: if all samples share the same label (positive or negative rate
+        is 100% or 0%), sklearn IsotonicRegression will raise
+        "y must be at least two classes"; in that case cal.f_ remains None,
+        and the upper layer's predict falls back to a fast-path without
+        calibration, so the pipeline won't crash.
     """
     bert_X, bert_y, llm_X, llm_y = [], [], [], []
     for s in samples:
@@ -1900,9 +1993,11 @@ def _fit_isotonic_calibrators(samples):
 
 
 def _calibrate_samples_inplace(samples, bert_cal, llm_cal):
-    """就地修改 samples 中 cand['bert_conf'] / cand['llm_conf'] 为校准后的 P(正确)。
-    仅对有 present 的项校准, 无 present 的 conf 保持 0.0。
-    重要: 此函数会破坏原始 conf, 调用方必须先 deep copy。
+    """In-place override of cand['bert_conf'] / cand['llm_conf'] with the
+    calibrated P(correct).
+    Only items with present=True are calibrated; non-present conf stays 0.0.
+    Important: this function overwrites the original conf; the caller must
+    deep copy first.
     """
     if not samples:
         return
@@ -1919,10 +2014,11 @@ def _calibrate_samples_inplace(samples, bert_cal, llm_cal):
 
 
 def _cal_fusion_predict(samples, type_alphas, threshold):
-    """校准 + per-type α 加权融合 (无共识加成, 无因子)。
-    公式: score = α(类型) * cal_bert + (1-α) * cal_llm;  keep if score >= th
-    输入 samples 必须是已校准的 (cand['bert_conf'/'llm_conf'] 已是 P(正确))。
-    type_alphas: dict{type: float} (per-type) 或 float (全局 α)。
+    """Calibration + per-type α weighted fusion (no consensus bonus, no factor).
+    Formula: score = α(type) * cal_bert + (1-α) * cal_llm; keep if score >= th
+    `samples` must be already calibrated (cand['bert_conf'/'llm_conf'] already
+    represent P(correct)).
+    type_alphas: dict{type: float} (per-type) or float (global α).
     """
     preds_list, labels_list = [], []
     for s in samples:
@@ -1942,8 +2038,9 @@ def _cal_fusion_predict(samples, type_alphas, threshold):
 
 
 def _cal_fusion_predict_metrics(samples, type_alphas, threshold):
-    """_cal_fusion_predict 的 fast 版, 返回 (tps, pns, tns) np.array。
-    用途: 网格搜 ~66 次 evaluate 加速 (与 static_fusion_predict_metrics 对齐)。"""
+    """Fast version of `_cal_fusion_predict` returning (tps, pns, tns) np.array.
+    Purpose: speed up the ~66-iteration grid search (aligned with
+    `static_fusion_predict_metrics`)."""
     n = len(samples)
     tps = np.zeros(n, dtype=np.int64)
     pns = np.zeros(n, dtype=np.int64)
@@ -1967,35 +2064,35 @@ def _cal_fusion_predict_metrics(samples, type_alphas, threshold):
 
 
 def run_calibrated_weighted_fusion(train_samples, test_samples, label='A_cal'):
-    """策略 A_cal: Calibrated Weighted Fusion (校准 + per-type α 加权)。
+    """Strategy A_cal: Calibrated Weighted Fusion (calibration + per-type α weighting).
     Steps:
-      1) 拟合 isotonic 校准器 (在 train_samples 上)
-      2) deep copy train/test samples, 应用校准 (in-place)
-      3) 全局网格搜 (α, th) → per-type α 微调
-      4) 输出 val / test P/R/F1
-    返回: (val_f1, test_f1, type_alphas, threshold, train_cal, test_cal, cal_info)
+      1) Fit isotonic calibrators on train_samples
+      2) Deep-copy train/test samples and apply calibration in-place
+      3) Global grid search (α, th) → per-type α refinement
+      4) Output val / test P/R/F1
+    Returns: (val_f1, test_f1, type_alphas, threshold, train_cal, test_cal, cal_info)
     """
     import copy as _copy
     print("\n" + "=" * 70)
-    print(f"【策略 {label}】Calibrated Weighted Fusion (校准 + per-type α 加权)")
+    print(f"【Strategy {label}】Calibrated Weighted Fusion (calibration + per-type α weighting)")
     print("=" * 70)
-    print("设计思路:")
-    print("  1) Isotonic Regression 校准 BERT/LLM conf → P(正确|conf)")
-    print("     解决 LLM conf 偏高/集中导致的加权偏差")
-    print("  2) per-type α 加权:  score = α*cal_bert + (1-α)*cal_llm")
-    print("  3) 网格搜 (α ∈ [0,1], th ∈ [0.2,0.7]) → per-type α 微调")
-    print("  4) 单一阈值 th (无共识加成, 无 bert/llm_only 因子)")
+    print("Design rationale:")
+    print("  1) Isotonic regression calibrates BERT/LLM conf → P(correct|conf)")
+    print("     to correct the bias caused by LLM conf being too high / concentrated")
+    print("  2) Per-type α weighting:  score = α*cal_bert + (1-α)*cal_llm")
+    print("  3) Grid search (α ∈ [0,1], th ∈ [0.2,0.7]) → per-type α refinement")
+    print("  4) Single threshold th (no consensus bonus, no bert/llm_only factor)")
     print("-" * 70)
 
-    # 1) 拟合校准器
-    print("\n  [1] 拟合 Isotonic 校准器 (在 train_samples 上) ...")
+    # 1) Fit calibrators
+    print("\n  [1] Fit isotonic calibrators (on train_samples) ...")
     bert_cal, llm_cal, n_b, n_l, n_b_pos, n_l_pos = _fit_isotonic_calibrators(train_samples)
     bert_rate = n_b_pos / n_b if n_b > 0 else 0.0
     llm_rate = n_l_pos / n_l if n_l > 0 else 0.0
-    print(f"      BERT: {n_b} 样本, 正例率 = {bert_rate:.3f}, "
-          f"校准器 fitted={bert_cal.f_ is not None}")
-    print(f"      LLM:  {n_l} 样本, 正例率 = {llm_rate:.3f}, "
-          f"校准器 fitted={llm_cal.f_ is not None}")
+    print(f"      BERT: {n_b} samples, positive rate = {bert_rate:.3f}, "
+          f"calibrator fitted={bert_cal.f_ is not None}")
+    print(f"      LLM:  {n_l} samples, positive rate = {llm_rate:.3f}, "
+          f"calibrator fitted={llm_cal.f_ is not None}")
     cal_info = {
         'n_bert': n_b, 'n_llm': n_l,
         'bert_pos_rate': bert_rate, 'llm_pos_rate': llm_rate,
@@ -2003,15 +2100,15 @@ def run_calibrated_weighted_fusion(train_samples, test_samples, label='A_cal'):
         'llm_cal_fitted': llm_cal.f_ is not None,
     }
 
-    # 2) deep copy + 校准
-    print("\n  [2] 应用校准 (deep copy 避免污染原 samples) ...")
+    # 2) Deep copy + apply calibration
+    print("\n  [2] Apply calibration (deep copy to avoid polluting the original samples) ...")
     train_cal = _copy.deepcopy(train_samples)
     test_cal = _copy.deepcopy(test_samples)
     _calibrate_samples_inplace(train_cal, bert_cal, llm_cal)
     _calibrate_samples_inplace(test_cal, bert_cal, llm_cal)
 
-    # 3) 全局网格搜 (α, th) — 校准后 conf ∈ [0,1], 阈值范围同 v3
-    print("\n  [3] 全局网格搜 (α ∈ [0, 1] 步长 0.1, th ∈ [0.2, 0.7] 步长 0.05) ...")
+    # 3) Global grid search (α, th) — calibrated conf ∈ [0,1], threshold range matches v3
+    print("\n  [3] Global grid search (α ∈ [0, 1] step 0.1, th ∈ [0.2, 0.7] step 0.05) ...")
     best_f1, best_th, best_alpha = 0.0, 0.4, 0.5
     type_alphas = {t: 0.5 for t in ALL_TYPES}
     alpha_range = list(np.arange(0.0, 1.05, 0.1))
@@ -2028,12 +2125,12 @@ def run_calibrated_weighted_fusion(train_samples, test_samples, label='A_cal'):
                 for t in ALL_TYPES:
                     type_alphas[t] = alpha
             if cnt % 20 == 0 or cnt == total:
-                print(f"      [{cnt}/{total}] 耗时 {time.time()-t0:.1f}s, "
-                      f"当前最优 F1={best_f1:.4f}")
-    print(f"  -> 全局最佳: α={best_alpha:.2f}, th={best_th:.2f}, F1={best_f1:.4f}")
+                print(f"      [{cnt}/{total}] elapsed {time.time()-t0:.1f}s, "
+                      f"current best F1={best_f1:.4f}")
+    print(f"  -> Global best: α={best_alpha:.2f}, th={best_th:.2f}, F1={best_f1:.4f}")
 
-    # 4) per-type α 微调
-    print(f"\n  [4] per-type α 微调 (th 固定 = {best_th:.2f}, α ∈ [0,1] 步长 0.05) ...")
+    # 4) Per-type α refinement
+    print(f"\n  [4] Per-type α refinement (th fixed = {best_th:.2f}, α ∈ [0,1] step 0.05) ...")
     for etype in ALL_TYPES:
         best_f1_t, best_alpha_t = 0.0, type_alphas[etype]
         for alpha in np.arange(0.0, 1.05, 0.05):
@@ -2046,19 +2143,21 @@ def run_calibrated_weighted_fusion(train_samples, test_samples, label='A_cal'):
         type_alphas[etype] = best_alpha_t
         print(f"      {etype}: α={best_alpha_t:.2f}, F1={best_f1_t:.4f}")
 
-    # 5) 验证集最终
-    print(f"\n  [5] 验证集最终结果 (α 与阈值见上):")
+    # 5) Final on validation set
+    print(f"\n  [5] Final results on the validation set (α and threshold above):")
     val_preds, val_labels = _cal_fusion_predict(train_cal, type_alphas, best_th)
     val_p, val_r, val_f1, val_tp, vp, vt = evaluate(val_preds, val_labels, tol=POSITION_TOLERANCE)
     print_metrics(f"{label} (val)", val_p, val_r, val_f1, val_tp, vp, vt)
 
-    # 6) 测试集
+    # 6) Test set
     test_preds, test_labels = _cal_fusion_predict(test_cal, type_alphas, best_th)
     test_p, test_r, test_f1, test_tp, tp_n, tt_n = evaluate(test_preds, test_labels, tol=POSITION_TOLERANCE)
     print_metrics(f"{label} (test)", test_p, test_r, test_f1, test_tp, tp_n, tt_n)
 
-    # 7) 校准贡献消融 — 关掉校准, 看纯 per-type α 加权能拿多少 F1
-    print(f"\n  [7] 校准贡献消融 (用未校准 conf 跑同样搜索, ΔF1 即为校准贡献):")
+    # 7) Calibration contribution ablation — turn calibration off, see how much
+    #    F1 a pure per-type α weighting can deliver
+    print(f"\n  [7] Calibration contribution ablation (same search on uncalibrated conf; "
+          f"ΔF1 = calibration contribution):")
     best_unc_f1, best_unc_th, best_unc_alpha = 0.0, 0.4, 0.5
     unc_alphas = {t: 0.5 for t in ALL_TYPES}
     for alpha in alpha_range:
@@ -2086,19 +2185,21 @@ def run_calibrated_weighted_fusion(train_samples, test_samples, label='A_cal'):
     cal_info['unc_alphas'] = unc_alphas
     cal_info['unc_th'] = best_unc_th
     cal_info['unc_test_f1'] = unc_test_f1
-    print(f"      校准后   test F1 = {test_f1:.4f}  (α per-type, th={best_th:.2f})")
-    print(f"      未校准   test F1 = {unc_test_f1:.4f}  (α per-type, th={best_unc_th:.2f})")
-    print(f"      校准贡献 ΔF1     = {cal_delta:+.4f}")
+    print(f"      Calibrated   test F1 = {test_f1:.4f}  (α per-type, th={best_th:.2f})")
+    print(f"      Uncalibrated test F1 = {unc_test_f1:.4f}  (α per-type, th={best_unc_th:.2f})")
+    print(f"      Calibration contribution ΔF1 = {cal_delta:+.4f}")
 
     return val_f1, test_f1, type_alphas, best_th, train_cal, test_cal, cal_info
 
 
 def _predict_with_calibrators_reuse_alphas(target_samples, train_for_fit,
                                             type_alphas, threshold):
-    """在 train_for_fit 上重 fit 校准器, 重新校准 target_samples, 用已搜好的
-    type_alphas / threshold 直接出 preds。
-    用途: 严格评估块中, A_cal 的 val 评估不能用 train_cal (in-sample),
-          必须用门控网络未见的 va_samples (8:2 切, 800 条)。
+    """Refit the calibrators on `train_for_fit`, recalibrate `target_samples`,
+    and produce predictions directly with the already-searched
+    `type_alphas` / `threshold`.
+    Purpose: in the strict evaluation block, A_cal's val evaluation cannot
+        use train_cal (in-sample). It must use va_samples (8:2 split, 800
+        items) that are unseen by the gating network.
     """
     import copy as _copy
     if train_for_fit is None or len(train_for_fit) == 0:
@@ -2113,31 +2214,33 @@ def _predict_with_calibrators_reuse_alphas(target_samples, train_for_fit,
 def run_gating_fusion(train_samples, test_samples, llm_lines, bert_lines, source='ner_models',
                       epochs=30, lr=2e-3, save_dir='saved_models_clean',
                       drop_beam_features=False):
-    """drop_beam_features=True: 训练门控网络时不喂 5-beam 特有特征 (B_b1 消融用)
-    网络结构分两套:
-      - 5b 模式 (drop_beam=False): 2×hidden=64 + 3 头 (w_bert/w_llm/bonus)
-        融合分 = w_bert*bert_conf + w_llm*llm_conf + bonus*both_pres*0.30
-        损失: BCE(combined, label) + 0.3 * 文本级 ranking
-      - b1 模式 (drop_beam=True):  1×hidden=32 + 1 头, 单 logit
-        融合分 = sigmoid(logit)
-        损失: BCE(logit, label) + 0.15 * MSE(sigmoid(logit), 0.5*llm+0.5*bert)
-        (具体切换在 train_gating 内按 model_tag=='b1' 自动处理)
+    """drop_beam_features=True: train the gating network without the 5-beam
+    specific features (used for the B_b1 ablation).
+    Two network architectures:
+      - 5b mode (drop_beam=False): 2×hidden=64 + 3 heads (w_bert/w_llm/bonus)
+        fusion = w_bert*bert_conf + w_llm*llm_conf + bonus*both_pres*0.30
+        loss: BCE(combined, label) + 0.3 * sample-level ranking
+      - b1 mode (drop_beam=True):  1×hidden=32 + 1 head, single logit
+        fusion = sigmoid(logit)
+        loss: BCE(logit, label) + 0.15 * MSE(sigmoid(logit), 0.5*llm+0.5*bert)
+        (the concrete switch is handled inside `train_gating` by checking
+         `model_tag=='b1'`)
     """
-    # 内部传 model_tag 给 train_gating, 让 5b / b1 各自存到独立文件名
+    # Pass model_tag to train_gating so 5b / b1 are saved to distinct file names
     model_tag = 'b1' if drop_beam_features else '5b'
     print("\n" + "=" * 70)
-    print("【策略 B】Gating Network Fusion (门控网络)")
+    print("【Strategy B】Gating Network Fusion")
     print("=" * 70)
     if drop_beam_features:
-        print("模式: b1 (Beam-1 only) — 单头 32 维, sigmoid(logit) 直接出分")
-        print("      损失: BCE + 0.15 * MSE(sigmoid(logit), 0.5*llm+0.5*bert)")
+        print("Mode: b1 (Beam-1 only) — single 32-dim head, sigmoid(logit) → score")
+        print("      Loss: BCE + 0.15 * MSE(sigmoid(logit), 0.5*llm+0.5*bert)")
     else:
-        print("模式: 5b — 3 头 (w_bert, w_llm, bonus)")
-        print("      融合分 = w_bert*bert_conf + w_llm*llm_conf + bonus*both_pres*0.30")
-        print("      损失: BCE(combined, label) + 0.3 * 文本级 ranking")
+        print("Mode: 5b — 3 heads (w_bert, w_llm, bonus)")
+        print("      Fusion = w_bert*bert_conf + w_llm*llm_conf + bonus*both_pres*0.30")
+        print("      Loss: BCE(combined, label) + 0.3 * sample-level ranking")
     print("-" * 70)
 
-    print("  [1] 训练/验证切分 (8:2) ...")
+    print("  [1] Train/validation split (8:2) ...")
     n = len(train_samples)
     rng = np.random.RandomState(GLOBAL_SEED)
     perm = rng.permutation(n)
@@ -2148,7 +2251,7 @@ def run_gating_fusion(train_samples, test_samples, llm_lines, bert_lines, source
 
     feats_tr, tids_tr, gids_tr, labs_tr = _candidates_to_features(tr_samples, drop_beam_features=drop_beam_features)
     feats_va, tids_va, gids_va, labs_va = _candidates_to_features(va_samples, drop_beam_features=drop_beam_features)
-    print(f"      训练候选: {len(feats_tr)}  验证候选: {len(feats_va)}")
+    print(f"      Train candidates: {len(feats_tr)}  Validation candidates: {len(feats_va)}")
     train_ds = TensorDataset(*_to_tensors(feats_tr, tids_tr, gids_tr, labs_tr,
                                             drop_beam_features=drop_beam_features))
     valid_ds = TensorDataset(*_to_tensors(feats_va, tids_va, gids_va, labs_va,
@@ -2156,17 +2259,18 @@ def run_gating_fusion(train_samples, test_samples, llm_lines, bert_lines, source
     train_loader = DataLoader(train_ds, batch_size=512, shuffle=True)
     valid_loader = DataLoader(valid_ds, batch_size=512, shuffle=False)
 
-    print(f"\n  [2] 训练门控网络 (epochs={epochs}, lr={lr}, drop_beam={drop_beam_features}) ...")
+    print(f"\n  [2] Train gating network (epochs={epochs}, lr={lr}, drop_beam={drop_beam_features}) ...")
     n_feats = 12 if drop_beam_features else 16
     model = GatingNetwork(num_types=NUM_TYPES, n_feats=n_feats)
     t0 = time.time()
     model = train_gating(model, train_loader, valid_loader,
                          epochs=epochs, lr=lr, patience=5, save_dir=save_dir,
                          model_tag=model_tag)
-    print(f"      训练耗时: {time.time() - t0:.1f}s")
+    print(f"      Training time: {time.time() - t0:.1f}s")
 
-    print("\n  [3] 全局阈值网格搜索 (在验证集上, 含 P/R 平衡):")
-    # 加速: 一次批量推理拿所有样本分数, 后续 th 扫描复用 (避免 ~40×800 次 model forward)
+    print("\n  [3] Global threshold grid search (on validation set, with P/R balance):")
+    # Speed-up: one batched inference retrieves every sample's scores; subsequent
+    # th sweeps reuse them (avoiding ~40×800 model forwards)
     val_scores = _gating_batch_scores(va_samples, model, drop=getattr(model, 'drop_beam_features', False))
     best_th, best_f1 = 0.5, 0.0
     for th in np.arange(0.05, 0.85, 0.02):
@@ -2188,7 +2292,8 @@ def run_gating_fusion(train_samples, test_samples, llm_lines, bert_lines, source
             print(f"      th={th:.2f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}{marker}")
         if f1 > best_f1:
             best_f1, best_th = f1, float(th)
-    # 同时找出 P≈R 的阈值 (差距最小), 备选 — 复用 val_scores, 不再重算
+    # Also find the P≈R threshold (smallest gap), as a fallback — reuse
+    # val_scores, no re-inference needed
     best_balanced_th, best_balanced_gap = 0.5, 1.0
     best_balanced_f1 = best_f1
     for th in np.arange(0.05, 0.85, 0.02):
@@ -2208,15 +2313,17 @@ def run_gating_fusion(train_samples, test_samples, llm_lines, bert_lines, source
         gap = abs(p - r)
         if gap < best_balanced_gap:
             best_balanced_gap, best_balanced_th, best_balanced_f1 = gap, float(th), f1
-    print(f"  -> 全局 F1 最佳: th={best_th:.2f}, F1={best_f1:.4f}")
-    print(f"  -> P/R 最平衡: th={best_balanced_th:.2f}  (P-R 差={best_balanced_gap:.4f})")
-    # 如果平衡阈值 F1 不显著差, 用平衡阈值
+    print(f"  -> Best F1 globally: th={best_th:.2f}, F1={best_f1:.4f}")
+    print(f"  -> Best P/R balance: th={best_balanced_th:.2f}  (P-R gap={best_balanced_gap:.4f})")
+    # If the balanced-threshold F1 is not significantly worse, prefer balance
     if best_balanced_f1 >= best_f1 - 0.003:
-        print(f"  -> 采用 P/R 平衡阈值 {best_balanced_th} (F1={best_balanced_f1:.4f}, 平衡更优)")
+        print(f"  -> Adopting P/R-balanced threshold {best_balanced_th} "
+              f"(F1={best_balanced_f1:.4f}, balance is better)")
         best_th = best_balanced_th
 
-    # 注: gating 网络的 combined score 已经是 per-sample 的连续可分值, 全局阈值即可。
-    print("\n  [4] per-type 微调 (范围 -0.10 ~ +0.10, 防止过拟合):")
+    # Note: the gating network's combined score is already a per-sample continuous
+    # value, so a global threshold is sufficient.
+    print("\n  [4] Per-type refinement (range -0.10 ~ +0.10, anti-overfit):")
     best_type_th = {t: best_th for t in ALL_TYPES}
     OFFSET = 0.10
     for etype in ALL_TYPES:
@@ -2243,8 +2350,9 @@ def run_gating_fusion(train_samples, test_samples, llm_lines, bert_lines, source
         best_type_th[etype] = best_t
         print(f"      {etype}: th={best_t:.2f}, F1={best_f_t:.4f}")
 
-    # 验证集 / 测试集最终结果: 复用 val_scores, 重新算 test_scores (一次性)
-    print("\n  [5] 验证集最终结果:")
+    # Final results on validation / test set: reuse val_scores, recompute
+    # test_scores (one-shot)
+    print("\n  [5] Final results on the validation set:")
     val_preds, val_labels = _filter_by_threshold(va_samples, val_scores, best_type_th)
     val_p, val_r, val_f1, val_tp, vp, vt = evaluate(val_preds, val_labels)
     print_metrics("Gating-Network (val)", val_p, val_r, val_f1, val_tp, vp, vt)
@@ -2253,85 +2361,96 @@ def run_gating_fusion(train_samples, test_samples, llm_lines, bert_lines, source
     test_preds, test_labels = _filter_by_threshold(test_samples, test_scores, best_type_th)
     test_p, test_r, test_f1, test_tp, tp_n, tt_n = evaluate(test_preds, test_labels)
     print_metrics("Gating-Network (test)", test_p, test_r, test_f1, test_tp, tp_n, tt_n)
-    # 返回 (val_f1, test_f1, type_th, (val_p/r, test_p/r), model) — model 用于论文严格评估重算
+    # Returns (val_f1, test_f1, type_th, (val_p/r, test_p/r), model) — `model`
+    # is reused for the strict paper-side evaluation
     return val_f1, test_f1, best_type_th, (val_p, val_r, test_p, test_r), model, va_samples
 
 
 # ====================================================================
-# 7. 主流程
+# 7. Main pipeline
 # ====================================================================
 def main():
-    # ---------- 配置 ----------
-    # 在这里选择数据集 (与原文件 main 中可选项对应)
+    # ---------- Configuration ----------
+    # Choose the dataset here (matches the selectable options in the original main)
     LLM_FILE = "evl_f1/mark/glm4_ner_confidence_beams5.jsonl"
     #LLM_FILE = "evl_f1/mark/lla_ner_Llama3-8B-confidence_beams_5.jsonl"
     BERT_FILE = "evl_f1/EGP_chinese-roberta-wwm-ext.jsonl"
     BERT_FILE = "evl_f1/TP_chinese-roberta-wwm-ext.jsonl"
 
     LLM_SOURCE = 'ner_models'
-    USE_BEAM = True  # 5-beam 投票
+    USE_BEAM = True  # 5-beam voting
 
-    TRAIN_SAMPLE_SIZE = 4000  # 训练 (含验证) 样本数
-    TEST_SAMPLE_SIZE = 1000   # 测试样本数
-    EPOCHS = 30               # 门控网络训练轮数
+    TRAIN_SAMPLE_SIZE = 4000  # Training (incl. validation) sample count
+    TEST_SAMPLE_SIZE = 1000   # Test sample count
+    EPOCHS = 30               # Gating network training epochs
     LR = 2e-3
     SAVE_DIR = "saved_models_clean"
 
     print("=" * 70)
-    print("LLM + BERT 实体融合 (重写整洁版)")
+    print("LLM + BERT Entity Fusion (clean rewrite)")
     print("=" * 70)
-    print(f"  LLM 文件:  {LLM_FILE}")
-    print(f"  BERT 文件: {BERT_FILE}")
-    print(f"  LLM 数据来源: {LLM_SOURCE}")
-    print(f"  Beam 投票:    {USE_BEAM}")
-    print(f"  位置容差:    {POSITION_TOLERANCE}")
+    print(f"  LLM file:  {LLM_FILE}")
+    print(f"  BERT file: {BERT_FILE}")
+    print(f"  LLM data source: {LLM_SOURCE}")
+    print(f"  Beam voting:     {USE_BEAM}")
+    print(f"  Position tolerance: {POSITION_TOLERANCE}")
     print()
 
-    # 1) 加载 + 切分
-    print("[Step 1] 加载数据并切分训练/测试集 ...")
+    # 1) Load + split
+    print("[Step 1] Load data and split train/test ...")
     llm_lines, bert_lines = load_data(LLM_FILE, BERT_FILE)
-    print(f"  加载完成: {len(llm_lines)} 条 (以较少的为准)")
+    print(f"  Loaded: {len(llm_lines)} entries (min of the two)")
     (train_llm, train_bert), (test_llm, test_bert) = split_train_test(
         llm_lines, bert_lines, test_size=TEST_SAMPLE_SIZE, seed=GLOBAL_SEED)
-    # 控制训练样本数
+    # Control training sample count
     train_llm = train_llm[:TRAIN_SAMPLE_SIZE]
     train_bert = train_bert[:TRAIN_SAMPLE_SIZE]
-    print(f"  训练池 (供门控网络 8:2 切): {len(train_llm)} 条")
-    print(f"  测试:                       {len(test_llm)} 条")
-    # 注: 验证集 (val) 在 run_gating_fusion 内部 8:2 切出 (n=tr//5), 不在 main 切
+    print(f"  Training pool (for 8:2 split in gating): {len(train_llm)} entries")
+    print(f"  Test:                                   {len(test_llm)} entries")
+    # Note: the validation set is split 8:2 inside `run_gating_fusion`
+    # (n=tr//5); not split here in main.
 
-    # 2) 解析 → samples (先用 α=0.7, β=0.05 占位, 后面 [Step 1.5] 搜最优后重 build)
-    print("\n[Step 2] 解析训练集 (初次, α=0.7 β=0.05 占位) ...")
+    # 2) Parse → samples (use α=0.7, β=0.05 as placeholders first; the optimal
+    #    values from [Step 1.5] are applied later via re-aggregation)
+    print("\n[Step 2] Parse training set (initial, α=0.7 β=0.05 placeholders) ...")
     global LLM_ALPHA, LLM_VOTE_REWARD
     LLM_ALPHA = 0.7
     LLM_VOTE_REWARD = 0.05
     train_samples = build_samples(train_llm, train_bert, source=LLM_SOURCE,
                                   tol=POSITION_TOLERANCE, use_beam=USE_BEAM)
-    print(f"  训练样本 (有效): {len(train_samples)}")
-    print("\n[Step 3] 解析测试集 (初次, α=0.7 β=0.05 占位) ...")
+    print(f"  Training samples (valid): {len(train_samples)}")
+    print("\n[Step 3] Parse test set (initial, α=0.7 β=0.05 placeholders) ...")
     test_samples = build_samples(test_llm, test_bert, source=LLM_SOURCE,
                                  tol=POSITION_TOLERANCE, use_beam=USE_BEAM)
-    print(f"  测试样本 (有效): {len(test_samples)}")
+    print(f"  Test samples (valid): {len(test_samples)}")
 
-    # 3.1) 【Beam-1 only 副本】用于消融实验: 模拟"LLM 服务只返回 1 个" 的公平对照
-    #     parse_llm_line 的 use_beam=False 分支已改为 _parse_mark_format_beam(models[:1], ...),
-    #     所以 cand['llm_conf'] = Beam-1 真实 conf, vote_count=1, 无 5-beam 投票信号
-    print("\n[Step 3.1] 解析 Beam-1 only 副本 (用于消融: A_b1 / B_b1) ...")
+    # 3.1) [Beam-1 only copy] for ablation experiments: simulates the fair
+    #      control where the LLM service returns only 1 candidate
+    #      `parse_llm_line`'s `use_beam=False` branch has been changed to
+    #      `_parse_mark_format_beam(models[:1], ...)`, so cand['llm_conf'] is
+    #      the true Beam-1 conf, vote_count=1, and there is no 5-beam vote signal
+    print("\n[Step 3.1] Parse Beam-1 only copy (for ablation: A_b1 / B_b1) ...")
     train_samples_b1 = build_samples(train_llm, train_bert, source=LLM_SOURCE,
                                       tol=POSITION_TOLERANCE, use_beam=False)
     test_samples_b1 = build_samples(test_llm, test_bert, source=LLM_SOURCE,
                                      tol=POSITION_TOLERANCE, use_beam=False)
-    print(f"  Beam-1 训练样本: {len(train_samples_b1)}  测试样本: {len(test_samples_b1)}")
+    print(f"  Beam-1 train samples: {len(train_samples_b1)}  test samples: {len(test_samples_b1)}")
 
-    # 1.5) 搜索最优 (α, β) (max+mean+vote_reward), 用 A 策略简化版的 train F1 选
-    # A 策略对 llm_conf 变化敏感, 比 A'' 适合做聚合评估
-    # 注: 此步搜出的 (α, β) 用在 train_samples (3000) 上, 严格评估块的 val 列在门控网络未见的 800 条上
+    # 1.5) Search optimal (α, β) (max+mean+vote_reward), using a simplified
+    # A strategy's train F1 as the target.
+    # The A strategy is sensitive to llm_conf changes, making it a good
+    # aggregation evaluator compared with A''.
+    # Note: (α, β) is searched on train_samples (3000); the strict evaluation
+    # block's val column is computed on the 800 items unseen by the gating network
     if USE_BEAM:
-        print("\n[Step 1.5] 搜索 (α, β) 参数 (max+mean+vote_reward), 以 A 策略简化版在 train_samples 上的 F1 为目标 ...")
-        # 加速: 30 次网格只重算 conf (调 _reaggregate_llm_confs), 不重 build_samples
+        print("\n[Step 1.5] Search (α, β) parameters (max+mean+vote_reward); "
+              "objective is A strategy's F1 on train_samples ...")
+        # Speed-up: only re-aggregate conf (via _reaggregate_llm_confs) in the
+        # 30 grid evaluations, do NOT rebuild_samples
         import copy
-        train_samples_base = copy.deepcopy(train_samples)  # 原始 llm_conf 作模板
-        # 用 A 策略简化版 (α_per_type=F1_bert/(F1_bert+F1_llm), bonus=0.05, th=0.5)
+        train_samples_base = copy.deepcopy(train_samples)  # original llm_conf as template
+        # Simplified A strategy (α_per_type = F1_bert / (F1_bert + F1_llm),
+        # bonus = 0.05, th = 0.5)
         def _quick_a_f1(samples):
             type_alphas = {}
             for tt in ALL_TYPES:
@@ -2347,10 +2466,11 @@ def main():
             return f1
 
         best_alpha, best_beta, best_alphabeta_f1 = 0.7, 0.05, 0.0
-        # β 搜索扩到 [-0.05, +0.10] 含 0, 用来确认"vote_reward 软奖励在 A 策略上确实无信号"
+        # β range extended to [-0.05, +0.10] including 0, to confirm that the
+        # vote_reward soft bonus truly carries no signal for the A strategy
         for alpha_try in [1.00, 0.85, 0.70, 0.55, 0.40]:
             for beta_try in [-0.05, 0.00, 0.03, 0.05, 0.08, 0.10]:
-                # 每次从 base 拷贝, 重算 conf (in-place 但 base 不变)
+                # Deep copy from base each time, recompute conf (in-place; base is unchanged)
                 _train = copy.deepcopy(train_samples_base)
                 _reaggregate_llm_confs(_train, alpha_try, beta_try)
                 _f1 = _quick_a_f1(_train)
@@ -2358,15 +2478,16 @@ def main():
                 print(f"      α={alpha_try:.2f}  β={beta_try:.2f}  A val F1={_f1:.4f}{marker}")
                 if _f1 > best_alphabeta_f1:
                     best_alphabeta_f1, best_alpha, best_beta = _f1, alpha_try, beta_try
-        print(f"  -> 最优 α={best_alpha:.2f}, β={best_beta:.2f}  (A val F1 = {best_alphabeta_f1:.4f})")
+        print(f"  -> Best α={best_alpha:.2f}, β={best_beta:.2f}  (A val F1 = {best_alphabeta_f1:.4f})")
         LLM_ALPHA = best_alpha
         LLM_VOTE_REWARD = best_beta
-        # 用最优参数重算 train/test 的 llm_conf (不再重 build_samples)
-        print(f"\n  [重算 conf] 用 α={best_alpha}, β={best_beta} 重新聚合 LLM conf ...")
+        # Re-aggregate llm_conf for train/test with the optimal parameters
+        # (no need to rebuild_samples)
+        print(f"\n  [Recompute conf] Use α={best_alpha}, β={best_beta} to re-aggregate LLM conf ...")
         _reaggregate_llm_confs(train_samples, best_alpha, best_beta)
         _reaggregate_llm_confs(test_samples,  best_alpha, best_beta)
 
-    # 2b) 打印 beam 投票分布
+    # 2b) Print beam vote distribution
     if USE_BEAM:
         from collections import Counter
         vote_dist = Counter()
@@ -2374,25 +2495,25 @@ def main():
             for c in s['candidates']:
                 if c['llm_present']:
                     vote_dist[int(c.get('vote_count', 1))] += 1
-        print("\n  [Beam 投票分布] (LLM-only 候选的 beam 票数):")
+        print("\n  [Beam vote distribution] (vote counts for LLM-only candidates):")
         for v in sorted(vote_dist):
-            print(f"    {v} 票: {vote_dist[v]} 候选")
-        # 共识 (BERT+LLM 共同) 的平均票数
+            print(f"    {v} votes: {vote_dist[v]} candidates")
+        # Average vote count of consensus (BERT+LLM) candidates
         both_votes = [c.get('vote_count', 1) for s in train_samples + test_samples
                       for c in s['candidates'] if c['bert_present'] and c['llm_present']]
         if both_votes:
-            print(f"    共识候选的平均票数: {sum(both_votes) / len(both_votes):.2f} "
-                  f"(共 {len(both_votes)} 个)")
+            print(f"    Average vote count of consensus candidates: {sum(both_votes) / len(both_votes):.2f} "
+                  f"(total {len(both_votes)})")
         solo_votes = [c.get('vote_count', 1) for s in train_samples + test_samples
                       for c in s['candidates']
                       if c['llm_present'] and not c['bert_present']]
         if solo_votes:
-            print(f"    单独 LLM 候选的平均票数: {sum(solo_votes) / len(solo_votes):.2f} "
-                  f"(共 {len(solo_votes)} 个)")
+            print(f"    Average vote count of LLM-only candidates: {sum(solo_votes) / len(solo_votes):.2f} "
+                  f"(total {len(solo_votes)})")
 
-    # 3) Baseline 指标
+    # 3) Baseline metrics
     print("\n" + "=" * 70)
-    print("【基线】单模型")
+    print("【Baseline】Single model")
     print("=" * 70)
     bert_preds, bert_labels = bert_only_predict(train_samples, train_llm, train_bert, source=LLM_SOURCE)
     bp_v, br_v, bf1_v, btp_v, bpn_v, btn_v = evaluate(bert_preds, bert_labels)
@@ -2401,14 +2522,14 @@ def main():
     bp, br, bf1_t, btp, bpn, btn = evaluate(bert_test_preds, bert_test_labels)
     print_metrics("BERT Only (test)", bp, br, bf1_t, btp, bpn, btn)
 
-    # 3) LLM Only 多个基线 (Top-1 ~ Top-5 + 5-union, 论文严格基线是 Top-1)
+    # 3) LLM-Only multiple baselines (Top-1 ~ Top-5 + 5-union; paper's strict baseline = Top-1)
     print("\n" + "=" * 90)
-    print("【LLM Only 基线 · 严格拆分】 (LLM 服务对外只返回 1 个最佳 → 论文主基线 = Top-1)")
+    print("【LLM-Only Baselines · Strict Split】 (LLM service returns only 1 best → paper's main baseline = Top-1)")
     print("=" * 90)
-    print(f"  {'基线':<24} | {'val (train)':^30} | {'test':^30}")
+    print(f"  {'Baseline':<24} | {'val (train)':^30} | {'test':^30}")
     print(f"  {'':<24} | {'P':>7} {'R':>7} {'F1':>7} | {'P':>7} {'R':>7} {'F1':>7}")
     print("  " + "-" * 78)
-    # Top-1 (论文主基线) ~ Top-5
+    # Top-1 (paper's main baseline) ~ Top-5
     llm_baselines = {}
     for k in range(5):
         v_preds, v_labels = llm_only_predict(train_samples, beam_idx=k)
@@ -2418,30 +2539,32 @@ def main():
         llm_baselines[k] = (p, r, f1, tp, tr, tf1)
         print(f"  LLM Top-{k+1} (Beam {k+1})".ljust(26) +
               f" | {p:>7.4f} {r:>7.4f} {f1:>7.4f} | {tp:>7.4f} {tr:>7.4f} {tf1:>7.4f}")
-    # 5-union 不加阈值 (原行为, 不严谨)
+    # 5-union without threshold (legacy behavior, not strict)
     v_preds, v_labels = llm_only_predict(train_samples, beam_idx=None)
     p, r, f1, _, _, _ = evaluate(v_preds, v_labels)
     t_preds, t_labels = llm_only_predict(test_samples, beam_idx=None)
     tp, tr, tf1, _, _, _ = evaluate(t_preds, t_labels)
     print(f"  LLM 5-Union (no-thr)  ".ljust(26) +
           f" | {p:>7.4f} {r:>7.4f} {f1:>7.4f} | {tp:>7.4f} {tr:>7.4f} {tf1:>7.4f}"
-          f"  ← 当前原 'LLM Only' 基线")
+          f"  ← current legacy 'LLM Only' baseline")
     llm_baselines['union'] = (p, r, f1, tp, tr, tf1)
-    # 5-union + conf 阈值 (Top-1 风格的严格做法)
+    # 5-union + conf threshold (Top-1 style, strict)
     v_preds, v_labels = llm_only_predict(train_samples, beam_idx=None, conf_th=0.5)
     p, r, f1, _, _, _ = evaluate(v_preds, v_labels)
     t_preds, t_labels = llm_only_predict(test_samples, beam_idx=None, conf_th=0.5)
     tp, tr, tf1, _, _, _ = evaluate(t_preds, t_labels)
     print(f"  LLM 5-Union (conf≥0.5)".ljust(26) +
           f" | {p:>7.4f} {r:>7.4f} {f1:>7.4f} | {tp:>7.4f} {tr:>7.4f} {tf1:>7.4f}"
-          f"  ← conf 过滤后")
+          f"  ← conf-filtered")
     print("  " + "-" * 78)
-    # 论文主基线: Top-1
+    # Paper's main baseline: Top-1
     lp_v, lr_v, lf1_v, lp, lr, lf1_t = llm_baselines[0]
 
-    # 4) 策略 A: 静态权重融合 (3-case 软融合)
+    # 4) Strategy A: Static Weight Fusion (3-case soft fusion)
     a_val, a_test, a_alphas, a_th, a_hyper = run_static_fusion(train_samples, test_samples)
-    # 重算 val/test P/R (汇总用, 必须用 a_hyper 里的网格搜出超参, 不能 hardcoded 否则会与 run 内部不一致)
+    # Recompute val/test P/R for the summary (must use the hyperparameters
+    # searched inside `run` via `a_hyper`; hardcoding would be inconsistent
+    # with the internal run)
     a_v_preds, _ = static_fusion_predict(
         train_samples, a_alphas, a_th,
         consensus_bonus=a_hyper['bonus'], consensus_th_mult=a_hyper['mult'],
@@ -2457,7 +2580,7 @@ def main():
     a_test_p, a_test_r, _, _, _, _ = evaluate(a_t_preds,
         [s['label_entities'] for s in test_samples])
 
-    # 4b) 策略 A'': Vote-Aware Hard-Rule
+    # 4b) Strategy A'': Vote-Aware Hard-Rule
     app_val, app_test, app_th, app_mvb, app_mvl = run_static_fusion_voteaware(
         train_samples, test_samples)
     app_vp, app_vr, _, _, _, _ = evaluate(
@@ -2467,7 +2590,7 @@ def main():
         static_fusion_voteaware_predict(test_samples, app_th, app_mvb, app_mvl)[0],
         [s['label_entities'] for s in test_samples])
 
-    # 4c) 策略 A_v2: Consensus V2
+    # 4c) Strategy A_v2: Consensus V2
     av2_val, av2_test, av2_bsolo, av2_lsolo, av2_mv_d, av2_ms_d, av2_stats = run_a_v2(
         train_samples, test_samples)
     av2_vp, av2_vr, _, _, _, _ = evaluate(
@@ -2477,14 +2600,17 @@ def main():
         a_v2_predict(test_samples, av2_bsolo, av2_lsolo, av2_mv_d, av2_ms_d)[0],
         [s['label_entities'] for s in test_samples])
 
-    # 4d) 策略 A_cal: Calibrated Weighted Fusion (校准 + per-type α 加权)
-    #     来自 gating_network_dp_mark_v3.py 策略3/9, 用 train_samples 拟合校准器,
-    #     deep copy 后的 train_cal / test_cal 走纯 2-特征加权 (无共识加成)
-    #     注: 5-beam 模式下 c['llm_conf'] 已是 α·max+(1-α)·mean+β·(N-1) 聚合,
-    #         校准仍能学习"高 conf 是否真" → 减少 LLM 主导偏差
+    # 4d) Strategy A_cal: Calibrated Weighted Fusion (calibration + per-type α weighting)
+    #     From gating_network_dp_mark_v3.py strategies 3/9; fit calibrators on
+    #     train_samples, and run pure 2-feature weighting (no consensus bonus)
+    #     on deep-copied train_cal / test_cal.
+    #     Note: under 5-beam mode c['llm_conf'] is already aggregated as
+    #         α·max + (1-α)·mean + β·(N-1); calibration can still learn
+    #         "is high conf actually correct" → reduces LLM-dominance bias.
     acal_val, acal_test, acal_alphas, acal_th, train_cal, test_cal, acal_info = \
         run_calibrated_weighted_fusion(train_samples, test_samples, label='A_cal')
-    # 重算 val/test P/R (汇总用, 必须用 acal_alphas / acal_th 内部搜出的超参)
+    # Recompute val/test P/R for the summary (must use the hyperparameters
+    # searched inside `run` via `acal_alphas` / `acal_th`)
     acal_v_preds, _ = _cal_fusion_predict(train_cal, acal_alphas, acal_th)
     acal_val_p, acal_val_r, _, _, _, _ = evaluate(
         acal_v_preds, [s['label_entities'] for s in train_cal], tol=POSITION_TOLERANCE)
@@ -2492,16 +2618,16 @@ def main():
     acal_test_p, acal_test_r, _, _, _, _ = evaluate(
         acal_t_preds, [s['label_entities'] for s in test_cal], tol=POSITION_TOLERANCE)
 
-    # 5) 策略 B: 门控网络融合
+    # 5) Strategy B: Gating Network Fusion
     b_val, b_test, b_th, (b_vp, b_vr, b_tp, b_tr), gating_model, va_samples = run_gating_fusion(
         train_samples, test_samples,
         train_llm, train_bert,
         source=LLM_SOURCE, epochs=EPOCHS, lr=LR, save_dir=SAVE_DIR,
     )
 
-    # 5.5) LLM 5 个 beam 各自的 P/R/F1 (供对比)
+    # 5.5) Per-beam P/R/F1 of the LLM (5 beams) for comparison
     print("\n" + "=" * 90)
-    print("【LLM 5-Beam 单独性能】 (按 beam 索引, 0=beam1 准确度最高)")
+    print("【LLM 5-Beam Per-Beam Performance】 (by beam index, 0=beam1 highest accuracy)")
     print("=" * 90)
     beam_results = []
     for k in range(5):
@@ -2511,13 +2637,13 @@ def main():
         print(f"  LLM Beam-{k+1} (val)  P={bv_p:.4f}  R={bv_r:.4f}  F1={bv_f1:.4f}")
         print(f"  LLM Beam-{k+1} (test) P={bt_p:.4f}  R={bt_r:.4f}  F1={bt_f1:.4f}")
 
-    # 5.6) 5-beam 投票 (5 取并集) vs 仅单 beam 的对比
-    print("\n【5-beam 取并集 (无阈值过滤)】")
+    # 5.6) 5-beam vote (5-way union) vs single-beam comparison
+    print("\n【5-beam union (no threshold)】")
     union_preds_v, union_labels_v = [], []
     union_preds_t, union_labels_t = [], []
 
     def _union_pred_and_llm_label(ll, bl):
-        """5-beam union preds + LLM 文件 label 字段 (mark 格式, 人工标注)"""
+        """5-beam union preds + LLM file's `label` field (mark format, human-annotated)"""
         ll_obj = _safe_parse_json(ll)
         if ll_obj is None:
             return [], []
@@ -2532,7 +2658,8 @@ def main():
             {'start_idx': e['start_idx'], 'end_idx': e['end_idx'],
              'type': e['type'], 'entity': e['entity']} for e in union_ents.values()
         ]
-        # ground truth 用 LLM 文件 label 字段 (人工标注), 不是 BERT 文件 (BERT 是推理结果)
+        # Ground truth uses the LLM file's `label` field (human annotation),
+        # not the BERT file (BERT contains inference results)
         label_text = ll_obj.get('label', '')
         raw_ents = parse_marked_text_with_pos(label_text)
         raw_ents = _correct_entity_positions(raw_ents, text)
@@ -2556,17 +2683,18 @@ def main():
     print(f"  5-beam union (test) P={utp:.4f}  R={utr:.4f}  F1={utf1:.4f}")
 
     # ============================================================
-    # 5.7) 【消融 A_b1 / B_b1】用 Beam-1 only 构造 samples
-    #     - cand['llm_conf'] = Beam-1 真实 conf (无 5-beam 聚合)
-    #     - cand['vote_count'] = 1 (无多 beam 投票信号)
-    #     目的: 对照"5 beam 投票"与"单 beam"的差异, 量化投票对融合的贡献
+    # 5.7) [Ablation A_b1 / B_b1] Build samples from Beam-1 only
+    #     - cand['llm_conf'] = Beam-1 true conf (no 5-beam aggregation)
+    #     - cand['vote_count'] = 1 (no multi-beam vote signal)
+    #     Purpose: contrast "5-beam voting" vs "single beam" to quantify
+    #     the contribution of voting to fusion
     # ============================================================
     print("\n" + "=" * 90)
-    print("【消融 A_b1 / B_b1】用 Beam-1 only (cand.llm_conf = Beam-1 真实 conf, vote_count=1)")
+    print("【Ablation A_b1 / B_b1】 Using Beam-1 only (cand.llm_conf = Beam-1 true conf, vote_count=1)")
     print("=" * 90)
 
-    # 5.7a) A_b1: 静态权重融合 (Beam-1 only)
-    print("\n  [A_b1] 静态权重融合 · Beam-1 only")
+    # 5.7a) A_b1: Static Weight Fusion (Beam-1 only)
+    print("\n  [A_b1] Static Weight Fusion · Beam-1 only")
     ab1_val, ab1_test, ab1_alphas, ab1_th, ab1_hyper = run_static_fusion(
         train_samples_b1, test_samples_b1)
     ab1_v_preds, _ = static_fusion_predict(
@@ -2586,13 +2714,17 @@ def main():
     print(f"  A_b1 (val=train)  P={ab1_vp:.4f}  R={ab1_vr:.4f}  F1={ab1_vf1:.4f}")
     print(f"  A_b1 (test)       P={ab1_tp:.4f}  R={ab1_tr:.4f}  F1={ab1_tf1:.4f}")
 
-    # 5.7b) B_b1: 门控网络 (Beam-1 only)
-    # 关键: Beam-1 模式下 cand['vote_count']=1, cand['llm_max_conf']=cand['llm_avg_conf']=cand['llm_conf'],
-    #       cand['best_beam_idx']=0 — 这 4 个"5 beam 特有"特征全退化为常数, 直接喂会让模型学到"vote=1=不可信"而崩。
-    # 修复: 用 drop_beam_features=True 让门控网络不喂这 4 个特征, 强制只用通用 12 维特征。
-    # 又: 为对齐 gating_network_dp_mark_v3.py 的 Gating Network 效果, 此处使用更稳的
-    #     超参 (epochs=100, lr=5e-4, patience=15) + BCE+0.15*MSE 蒸馏损失
-    #     (在 train_gating 内部按 model_tag=='b1' 自动切换)
+    # 5.7b) B_b1: Gating Network (Beam-1 only)
+    # Important: under Beam-1 mode, cand['vote_count']=1, cand['llm_max_conf']
+    #   = cand['llm_avg_conf'] = cand['llm_conf'], cand['best_beam_idx']=0 — these
+    #   4 "5-beam specific" features all degenerate to constants. Feeding them
+    #   would make the model learn "vote=1=untrustworthy" and collapse.
+    # Fix: use drop_beam_features=True to keep the gating network from seeing
+    #      those 4 features, forcing it to use only the 12 generic ones.
+    # And: to align with gating_network_dp_mark_v3.py's Gating Network behavior,
+    #      use more stable hyperparameters (epochs=100, lr=5e-4, patience=15)
+    #      + BCE + 0.15*MSE distillation loss (the switch is handled inside
+    #      train_gating by checking model_tag=='b1')
     print("\n  [B_b1] Gating Network · Beam-1 only (drop_beam_features=True)")
     bb1_val, bb1_test, bb1_th, (bb1_vp, bb1_vr, bb1_tp, bb1_tr), bb1_model, bb1_va = run_gating_fusion(
         train_samples_b1, test_samples_b1,
@@ -2600,14 +2732,17 @@ def main():
         source=LLM_SOURCE, epochs=100, lr=5e-4, save_dir=SAVE_DIR,
         drop_beam_features=True,
     )
-    # bb1_va 已是 b1 样本的 8:2 切分验证集 (run_gating_fusion 内部用 GLOBAL_SEED 切的)
-    # A_b1 严格评估也用同一份, 保证两个 b1 策略的 val/test 来自同一划分
+    # bb1_va is the 8:2 split validation set on the b1 samples (split inside
+    # run_gating_fusion with GLOBAL_SEED). A_b1's strict evaluation reuses the
+    # same split, so both b1 strategies' val/test come from the same partition
     va_samples_b1 = bb1_va
 
     # 5.7c) A_cal_b1: Calibrated Weighted Fusion (Beam-1 only)
-    #     用 train_samples_b1 重 fit 校准器 — 不能直接用 5-beam 的校准器,
-    #     因 LLM conf 分布 (单 beam vs 5-beam 聚合) 不同 → 校准尺度不一致
-    #     该消融用于回答"v3 log +0.0033 在 Beam-1 模式下能否在 st8 复现"
+    #     Refit the calibrators on train_samples_b1 — the 5-beam calibrators
+    #     cannot be reused, because the LLM conf distribution (single beam vs
+    #     5-beam aggregated) is different → calibration scales mismatch.
+    #     This ablation answers the question "can v3 log +0.0033 be reproduced
+    #     in st8 under Beam-1 mode"
     print("\n  [A_cal_b1] Calibrated Weighted Fusion · Beam-1 only")
     acalb1_val, acalb1_test, acalb1_alphas, acalb1_th, train_cal_b1, test_cal_b1, acalb1_info = \
         run_calibrated_weighted_fusion(train_samples_b1, test_samples_b1, label='A_cal_b1')
@@ -2619,15 +2754,17 @@ def main():
         acalb1_t_preds, [s['label_entities'] for s in test_cal_b1], tol=POSITION_TOLERANCE)
     print(f"  A_cal_b1 (val=train)  P={acalb1_vp:.4f}  R={acalb1_vr:.4f}  F1={acalb1_vf1:.4f}")
     print(f"  A_cal_b1 (test)       P={acalb1_tp:.4f}  R={acalb1_tr:.4f}  F1={acalb1_tf1:.4f}")
-    # 严格评估块的 b1 验证集也用同一份 (8:2 切, 与 B_b1 一致)
+    # The strict evaluation block for b1 also uses the same split (8:2), aligned with B_b1
 
-    # 6) 汇总 (P / R / F1 全列)
-    # 注: 此表 val 列 = train_samples (3000) 上的 F1, 包含门控网络训练样本 (有数据泄露)
-    # 真未见 val 性能见后文 "【论文严格评估】" 块 (val=va_samples, 800 条, 门控网络未见的)
+    # 6) Summary (P / R / F1 columns)
+    # Note: the val column of this table is the F1 on train_samples (3000),
+    # which contains the gating network's training samples (data leakage).
+    # The truly-unseen val performance is in the "【Paper Strict Evaluation】"
+    # block below (val=va_samples, 800 items, unseen by the gating network)
     print("\n" + "=" * 90)
-    print("最终结果汇总 (P / R / F1) — val 列=train_samples(3000), 真未见 val 见严格评估块")
+    print("Final Summary (P / R / F1) — val column=train_samples(3000); truly-unseen val in strict block")
     print("=" * 90)
-    hdr = (f"  {'策略':<36} | {'val (=train)':^20} | {'test':^20} | {'Δ test':>8}")
+    hdr = (f"  {'Strategy':<36} | {'val (=train)':^20} | {'test':^20} | {'Δ test':>8}")
     print(hdr)
     sub = (f"  {'':<36} | {'P':>6} {'R':>6} {'F1':>6} | "
            f"{'P':>6} {'R':>6} {'F1':>6} | {'F1':>8}")
@@ -2637,54 +2774,60 @@ def main():
         delta = tf - bf1_t
         return (f"  {name:<36} | {vp:>6.4f} {vr:>6.4f} {vf:>6.4f} | "
                 f"{tp:>6.4f} {tr:>6.4f} {tf:>6.4f} | {delta:>+8.4f}")
-    print(row("[基线] BERT Only", bp_v, br_v, bf1_v, bp, br, bf1_t))
-    print(row("[基线] LLM Only",  lp_v, lr_v, lf1_v, lp, lr, lf1_t))
-    # 5 个 LLM beam 各自基线 (按用户说明: beam 1 准确度最高, 5 最低)
+    print(row("[Baseline] BERT Only", bp_v, br_v, bf1_v, bp, br, bf1_t))
+    print(row("[Baseline] LLM Only",  lp_v, lr_v, lf1_v, lp, lr, lf1_t))
+    # 5 LLM beam individual baselines (per user note: beam 1 highest accuracy, beam 5 lowest)
     for k in range(5):
         bvp, bvr, bvf, btp, btr, btf = beam_results[k]
-        print(row(f"[基线] LLM Beam-{k+1}", bvp, bvr, bvf, btp, btr, btf))
-    print(row("[基线] LLM 5-beam union (无阈值)", uvp, uvr, uvf1, utp, utr, utf1))
+        print(row(f"[Baseline] LLM Beam-{k+1}", bvp, bvr, bvf, btp, btr, btf))
+    print(row("[Baseline] LLM 5-beam union (no threshold)", uvp, uvr, uvf1, utp, utr, utf1))
     print(row("A. Static Weight", a_val_p, a_val_r, a_val, a_test_p, a_test_r, a_test))
     print(row("A''. Vote-Aware Hard-Rule",     app_vp, app_vr, app_val, app_tp, app_tr, app_test))
     print(row("A_v2. Consensus",               av2_vp, av2_vr, av2_val, av2_tp, av2_tr, av2_test))
     print(row("A_cal. Calibrated Weighted",    acal_val_p, acal_val_r, acal_val,
               acal_test_p, acal_test_r, acal_test))
-    print(f"  [消融] A_cal 校准贡献: 校准后={acal_test:.4f} vs 未校准={acal_info.get('unc_test_f1', 0):.4f}"
+    print(f"  [Ablation] A_cal calibration contribution: calibrated={acal_test:.4f} "
+          f"vs uncalibrated={acal_info.get('unc_test_f1', 0):.4f}"
           f" → Δ={acal_test - acal_info.get('unc_test_f1', 0):+.4f}")
     print(row("B. Gating Network",             b_vp, b_vr, b_val, b_tp, b_tr, b_test))
-    print("  --- 消融: Beam-1 only (cand.llm_conf = Beam-1 真实 conf, 无 5 beam 投票) ---")
-    # 注: 此处 val 列对 b1 策略是 in-sample (val=train_samples_b1, 含训练样本, 数据泄露),
-    #     真未见 val (bb1_va) 性能见后文"【论文严格评估】"块的 A_b1/B_b1 行 — 与本表同名以便对比
+    print("  --- Ablation: Beam-1 only (cand.llm_conf = Beam-1 true conf, no 5-beam voting) ---")
+    # Note: the val column for the b1 strategies is in-sample (val=train_samples_b1,
+    # contains training samples, data leakage). The truly-unseen val (bb1_va)
+    # performance is in the "【Paper Strict Evaluation】" block, rows A_b1/B_b1 —
+    # same names so the two tables are easy to compare
     print(row("A_b1. Static (Beam-1)",     ab1_vp, ab1_vr, ab1_vf1, ab1_tp, ab1_tr, ab1_tf1))
     print(row("A_cal_b1. Calibrated (Beam-1)", acalb1_vp, acalb1_vr, acalb1_vf1,
               acalb1_tp, acalb1_tr, acalb1_tf1))
-    print(f"  [消融] A_cal_b1 校准贡献: 校准后={acalb1_tf1:.4f} vs "
-          f"未校准={acalb1_info.get('unc_test_f1', 0):.4f}"
+    print(f"  [Ablation] A_cal_b1 calibration contribution: calibrated={acalb1_tf1:.4f} "
+          f"vs uncalibrated={acalb1_info.get('unc_test_f1', 0):.4f}"
           f" → Δ={acalb1_tf1 - acalb1_info.get('unc_test_f1', 0):+.4f}")
     print(row("B_b1. Gating (Beam-1)",     bb1_vp, bb1_vr, bb1_val, bb1_tp, bb1_tr, bb1_test))
     print("=" * 90)
 
     # ============================================================
-    # 7) 【论文严格评估】用 tol=POSITION_TOLERANCE 重算 + Bootstrap 95% CI + 显著性检验
+    # 7) [Paper Strict Evaluation] Re-evaluate with tol=POSITION_TOLERANCE
+    #    + Bootstrap 95% CI + significance test
     # ============================================================
     print("\n" + "=" * 90)
-    print("【论文严格评估】 tol=POSITION_TOLERANCE (与 build_candidates 对齐) + Bootstrap 95% CI")
+    print("【Paper Strict Evaluation】 tol=POSITION_TOLERANCE (aligned with build_candidates) "
+          "+ Bootstrap 95% CI")
     print("=" * 90)
-    TOL_EVAL = POSITION_TOLERANCE  # 论文主评估 = 2 (与候选生成一致)
+    TOL_EVAL = POSITION_TOLERANCE  # Paper's main evaluation = 2 (aligned with candidate generation)
 
     def _label_list(samples):
         return [s['label_entities'] for s in samples]
 
-    # 重算所有策略的 preds, 收集到 dict
-    # val 列用 va_samples (来自 run_gating_fusion 内部 8:2 切出的 800 条, 门控网络真未见过的验证集)
-    # test 列用 test_samples (1000 条, 最终测试)
-    # 不用 train_samples (有数据泄露, 门控网络已在 tr_samples 上训过)
+    # Recompute preds for all strategies and collect them into a dict
+    # val column uses va_samples (the 800 items split 8:2 inside run_gating_fusion;
+    # truly unseen by the gating network)
+    # test column uses test_samples (1000 items, final test)
+    # Do NOT use train_samples (data leakage: the gating network was trained on tr_samples)
     strategy_preds = {}
     # 1) BERT Only
     bp_v_pre, _ = bert_only_predict(va_samples, train_llm, train_bert, source=LLM_SOURCE)
     bp_t_pre, _ = bert_only_predict(test_samples, test_llm, test_bert, source=LLM_SOURCE)
     strategy_preds['BERT Only']        = (bp_v_pre, bp_t_pre)
-    # 2) LLM Only (Top-1, 论文主基线)
+    # 2) LLM Only (Top-1, paper's main baseline)
     lp_v_pre, _ = llm_only_predict(va_samples, beam_idx=0)
     lp_t_pre, _ = llm_only_predict(test_samples, beam_idx=0)
     strategy_preds['LLM Top-1']        = (lp_v_pre, lp_t_pre)
@@ -2707,34 +2850,42 @@ def main():
     at_v2_pre, _ = a_v2_predict(test_samples, av2_bsolo, av2_lsolo, av2_mv_d, av2_ms_d)
     strategy_preds['A_v2. Consensus']  = (av_v2_pre, at_v2_pre)
     # 5b) A_cal: Calibrated Weighted Fusion (5-beam)
-    # 关键: val 严格评估用 va_samples (8:2 切, 门控网络未见) + 5-beam 校准器
-    #       test 用 test_samples + 5-beam 校准器
-    #       A_cal_alphas/th 由 run_calibrated_weighted_fusion 内部在 train_samples
-    #       拟合超参, 用同一 alphas/th 在 va_samples (门控网络未见, 800 条)
-    #       上重算 score → 严格无数据泄露
-    # 注: acal_train_cal / acal_test_cal 是 deep copy 后的校准样本, 不能直接用
-    #     va_samples (会丢校准步骤). 解决: 在 strict 块重新校准 va_samples / test_samples
+    # Important: the val strict evaluation uses va_samples (8:2 split, unseen
+    # by the gating network) + 5-beam calibrators; test uses test_samples +
+    # 5-beam calibrators. `acal_alphas/th` were searched inside
+    # `run_calibrated_weighted_fusion` on train_samples; the same alphas/th
+    # are applied on va_samples (unseen, 800 items) to recompute scores →
+    # strictly no data leakage.
+    # Note: acal_train_cal / acal_test_cal are deep-copied calibrated samples
+    # and cannot be used directly on va_samples (would skip the calibration
+    # step). Solution: recalibrate va_samples / test_samples inside the strict
+    # block.
     av_cal_pre = _predict_with_calibrators_reuse_alphas(
         va_samples, train_samples, acal_alphas, acal_th)
     at_cal_pre = _predict_with_calibrators_reuse_alphas(
         test_samples, train_samples, acal_alphas, acal_th)
     strategy_preds['A_cal. Calibrated']  = (av_cal_pre, at_cal_pre)
     # 5b') A_cal_b1: Calibrated Weighted Fusion (Beam-1 only)
-    # 关键: 严格评估必须用 b1 解析的样本 (va_samples_b1 / test_samples_b1),
-    #       不可用 5b 解析的 va_samples / test_samples — 5b 的 llm_conf 已经是
-    #       α·max+(1-α)·mean+β·(N-1) 聚合, 与 b1 的单 beam conf 分布不同,
-    #       会导致 acalb1_alphas/th 应用到错误分布, F1 严重偏低
+    # Important: the strict evaluation must use b1-parsed samples
+    # (va_samples_b1 / test_samples_b1), not 5b-parsed va_samples / test_samples
+    # — the 5b llm_conf is already aggregated as
+    # α·max+(1-α)·mean+β·(N-1), which has a different distribution from the
+    # b1 single-beam conf. Applying acalb1_alphas/th to the wrong distribution
+    # makes F1 collapse badly.
     av_calb1_pre = _predict_with_calibrators_reuse_alphas(
         va_samples_b1, train_samples_b1, acalb1_alphas, acalb1_th)
     at_calb1_pre = _predict_with_calibrators_reuse_alphas(
         test_samples_b1, train_samples_b1, acalb1_alphas, acalb1_th)
     strategy_preds['A_cal_b1. Calibrated (Beam-1)'] = (av_calb1_pre, at_calb1_pre)
-    # 6) A_b1 (消融: Static Weight + Beam-1 only)
-    # 关键: 严格评估必须用 b1 解析的样本 (va_samples_b1 / test_samples_b1),
-    #       不可用 5b 解析的 va_samples / test_samples — 5b 的 llm_conf 已经是
-    #       α·max+(1-α)·mean+β·(N-1) 聚合, 与 b1 的单 beam conf 分布不同,
-    #       会导致 ab1_alphas/ab1_th 应用到错误分布, F1 严重偏低
-    #       (旧版 val 0.7205 / test 0.7222 → 修复后应接近 main 表 0.7519/0.7483)
+    # 6) A_b1 (Ablation: Static Weight + Beam-1 only)
+    # Important: the strict evaluation must use b1-parsed samples
+    # (va_samples_b1 / test_samples_b1), not 5b-parsed va_samples /
+    # test_samples — the 5b llm_conf is already aggregated as
+    # α·max+(1-α)·mean+β·(N-1), which has a different distribution from the
+    # b1 single-beam conf. Applying ab1_alphas/ab1_th to the wrong
+    # distribution makes F1 collapse badly.
+    # (old val 0.7205 / test 0.7222 → after fix should approach the
+    # main-table 0.7519/0.7483)
     av_b1_pre, _ = static_fusion_predict(va_samples_b1, ab1_alphas, ab1_th,
         consensus_bonus=ab1_hyper['bonus'], consensus_th_mult=ab1_hyper['mult'],
         bert_only_factor=ab1_hyper['bf'], llm_only_factor=ab1_hyper['lf'],
@@ -2746,7 +2897,8 @@ def main():
     strategy_preds['A_b1. Static (Beam-1)']  = (av_b1_pre, at_b1_pre)
     # 8) B. Gating Network
     if gating_model is not None:
-        # 加速: 一次性批量推理拿 val/test scores, 然后按 best_type_th 筛
+        # Speed-up: one-shot batched inference to get val/test scores, then
+        # filter by best_type_th
         bv_scores = _gating_batch_scores(va_samples, gating_model,
                                           drop=getattr(gating_model, 'drop_beam_features', False))
         bt_scores = _gating_batch_scores(test_samples, gating_model,
@@ -2755,11 +2907,12 @@ def main():
         bt_pre, _ = _filter_by_threshold(test_samples, bt_scores, b_th)
         strategy_preds['B. Gating Net'] = (bv_pre, bt_pre)
     else:
-        print("  [skip B] gating_model 不在 main 作用域, 跳过 B 的严格评估")
-    # 7) B_b1 (消融: Gating + Beam-1 only)
-    # 关键: 严格评估必须用 b1 解析的样本 (bb1_va / test_samples_b1),
-    #       不可用 5b 解析的 va_samples / test_samples — bb1_model 在 12 维通用特征上训练,
-    #       应用到 5b 样本的 llm_conf 分布会失配, F1 严重偏低
+        print("  [skip B] gating_model is not in main's scope, skip B's strict evaluation")
+    # 7) B_b1 (Ablation: Gating + Beam-1 only)
+    # Important: the strict evaluation must use b1-parsed samples
+    # (bb1_va / test_samples_b1), not 5b-parsed va_samples / test_samples —
+    # bb1_model was trained on 12-d generic features; applying it to 5b
+    # samples' llm_conf distribution will mismatch, F1 collapses badly.
     if bb1_model is not None:
         bv_b1_scores = _gating_batch_scores(bb1_va, bb1_model,
                                              drop=getattr(bb1_model, 'drop_beam_features', False))
@@ -2769,22 +2922,23 @@ def main():
         bt_b1_pre, _ = _filter_by_threshold(test_samples_b1, bt_b1_scores, bb1_th)
         strategy_preds['B_b1. Gating (Beam-1)'] = (bv_b1_pre, bt_b1_pre)
     else:
-        print("  [skip B_b1] bb1_model 不在 main 作用域, 跳过 B_b1 严格评估")
+        print("  [skip B_b1] bb1_model is not in main's scope, skip B_b1's strict evaluation")
 
-    val_labels = _label_list(va_samples)   # 门控网络未见的 800 条的 label (与训练集 tr_samples 互不重叠)
+    val_labels = _label_list(va_samples)   # labels of the 800 items unseen by the gating network (no overlap with tr_samples)
     test_labels = _label_list(test_samples)
 
-    # 加速: 一次性预计算所有策略的 (tps, pns, tns), 避免 bootstrap 重算 set
-    print(f"\n  [预计算] 8 策略 × (val, test) = 16 组 metrics, 一次性算 ...")
+    # Speed-up: precompute (tps, pns, tns) for all strategies once, so the
+    # bootstrap resampling does not redo set ops
+    print(f"\n  [Precompute] 8 strategies × (val, test) = 16 metric groups, compute once ...")
     pre_v = {name: _precompute_metrics(vp, val_labels, tol=TOL_EVAL)
              for name, (vp, _) in strategy_preds.items()}
     pre_t = {name: _precompute_metrics(tp, test_labels, tol=TOL_EVAL)
              for name, (_, tp) in strategy_preds.items()}
 
-    # 用 tol=2 重算 P/R/F1
-    print(f"\n  tol = {TOL_EVAL} (与 build_candidates 一致)")
-    # 表头: val/test 各列 P / R / F1 + 95% CI
-    print(f"  {'策略':<22} | {'val P':>7} {'val R':>7} {'val F1':>7} {'95% CI':<17} | "
+    # Re-evaluate P/R/F1 with tol=2
+    print(f"\n  tol = {TOL_EVAL} (aligned with build_candidates)")
+    # Header: val/test columns of P / R / F1 + 95% CI
+    print(f"  {'Strategy':<22} | {'val P':>7} {'val R':>7} {'val F1':>7} {'95% CI':<17} | "
         f"{'test P':>7} {'test R':>7} {'test F1':>7} {'95% CI':<17} | {'Δ F1':>8}")
     print("  " + "-" * 120)
 
@@ -2792,7 +2946,7 @@ def main():
     for name, (vp, tp) in strategy_preds.items():
         tps_v, pns_v, tns_v = pre_v[name]
         tps_t, pns_t, tns_t = pre_t[name]
-        # 整体 P/R/F1
+        # Overall P/R/F1
         tp_sum = int(tps_v.sum()); pn_sum = int(pns_v.sum()); tn_sum = int(tns_v.sum())
         pv = tp_sum / pn_sum if pn_sum else 0.0
         rv = tp_sum / tn_sum if tn_sum else 0.0
@@ -2809,8 +2963,8 @@ def main():
         print(f"  {name:<22} | {pv:>7.4f} {rv:>7.4f} {fv:>7.4f} [{lov:>5.3f}, {hiv:>5.3f}] | "
             f"{pt:>7.4f} {rt:>7.4f} {ft:>7.4f} [{lot:>5.3f}, {hit_:>5.3f}] | {delta:>+8.4f}")
 
-    # 关键对比的 paired bootstrap 显著性检验 (走预计算数组)
-    print(f"\n  【显著性检验】Paired Bootstrap (H0: ΔF1 = 0, n_boot=1000):")
+    # Paired-bootstrap significance test on key comparisons (uses precomputed arrays)
+    print(f"\n  【Significance Test】 Paired Bootstrap (H0: ΔF1 = 0, n_boot=1000):")
     base = 'BERT Only'
     if base in strategy_preds:
         for name in ['LLM Top-1', 'A. Static Weight',

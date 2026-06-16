@@ -1,27 +1,25 @@
-# Bert 和 LLM 融合方法
+# BERT and LLM Fusion Method
 
-## 基线Bert 训练
+## Baseline BERT Training
 
-[TPLinker 框架训练](https://github.com/kangjunxiang/pytorch_TPLinker_Plus_Ner)
+[TPLinker framework training](https://github.com/kangjunxiang/pytorch_TPLinker_Plus_Ner)
 
-[EGP 框架训练](https://github.com/kangjunxiang/pytorch_GlobalPointer_Ner)
+[EGP framework training](https://github.com/kangjunxiang/pytorch_GlobalPointer_Ner)
 
-### Bert 模型下载
+### BERT Model Downloads
 
- [hfl/chinese-bert-wwm-ext · HF Mirror](https://hf-mirror.com/hfl/chinese-bert-wwm-ext) 
+- [hfl/chinese-bert-wwm-ext · HF Mirror](https://hf-mirror.com/hfl/chinese-bert-wwm-ext)
+- [hfl/chinese-roberta-wwm-ext · HF Mirror](https://hf-mirror.com/hfl/chinese-roberta-wwm-ext)
+- [google-bert/bert-base-chinese · HF Mirror](https://hf-mirror.com/google-bert/bert-base-chinese)
 
- [hfl/chinese-roberta-wwm-ext · HF Mirror](https://hf-mirror.com/hfl/chinese-roberta-wwm-ext) 
+## LLM Fine-tuning
 
- [google-bert/bert-base-chinese · HF Mirror](https://hf-mirror.com/google-bert/bert-base-chinese) 
+[LLM fine-tuning toolkit](https://github.com/hiyouga/LlamaFactory)
 
-## 大模型微调
+## Dataset Download
 
-[大模型微调使用工具](https://github.com/hiyouga/LlamaFactory)
+The CMeEE-V dataset can be requested from the following link: https://tianchi.aliyun.com/dataset/95414
 
-## 数据集下载
+## Model Fusion
 
-对应CMeEE-V数据集可从以下链接申请获取：https://tianchi.aliyun.com/dataset/95414  
-
-## 模型融合
-
-相对融合方法详见 integration.py
+See `integration.py` for details on the fusion methods.

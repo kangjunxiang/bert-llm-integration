@@ -17,7 +17,7 @@ torch.cuda.empty_cache()
 class NerEtl:
     def __init__(self, use_lora=True):
         self.base_model_path = '/data/yh/HF-LLM-models/hub/models--deepseek-ai--DeepSeek-R1-Distill-Llama-8B/snapshots/6a6f4aa4197940add57724a7707d069478df56b1'
-        # 仅在加载 LoRA 时需要路径
+        # Only required when loading the LoRA adapter
         self.lora_model_path = '/data/yh/LLM-train-saves/DeepSeek-R1-Distill-Llama-8B-mark/lora/train_lora_5epochs_indexU' if use_lora else None
         self.tokenizer_path = '/data/yh/HF-LLM-models/hub/models--deepseek-ai--DeepSeek-R1-Distill-Llama-8B/snapshots/6a6f4aa4197940add57724a7707d069478df56b1'
         self.load_in_4bit = False
@@ -25,11 +25,11 @@ class NerEtl:
         self.load_type = torch.float16
         self.use_lora = use_lora
 
-        # 生成答案数量
+        # Number of candidate answers
         self.answer_num = 5
-        self.num_beams = 5            # 必须 ≥ answer_num
+        self.num_beams = 5            # Must be >= answer_num
 
-        # 标注式提示词
+        # Mark-style system prompt (Chinese by design — used as the LLM input)
         self.system_prompt = (
             "您是医学实体识别机器人。您的任务是将输入文本中的实体类别按要求输出。"
             "您将仅使用预定义的实体类别进行响应。 请勿提供额外的解释或注释。\n"
@@ -78,13 +78,13 @@ class NerEtl:
             quantization_config=quantization_config
         )
 
-        # 对齐词表大小
+        # Align the vocabulary sizes between the base model and the tokenizer
         model_vocab_size = base_model.get_input_embeddings().weight.size(0)
         tokenizer_vocab_size = len(self.tokenizer)
         if model_vocab_size != tokenizer_vocab_size:
             base_model.resize_token_embeddings(tokenizer_vocab_size)
 
-        # 根据开关决定是否加载LoRA
+        # Load the LoRA adapter when explicitly requested
         if self.use_lora and self.lora_model_path is not None:
             self.model = PeftModel.from_pretrained(
                 base_model,
@@ -92,10 +92,10 @@ class NerEtl:
                 torch_dtype=self.load_type,
                 device_map='auto',
             ).half()
-            print("已加载 LoRA 适配器，使用微调后模型。")
+            print("LoRA adapter loaded, using the fine-tuned model.")
         else:
             self.model = base_model.half()
-            print("未加载 LoRA，使用微调前基座模型。")
+            print("No LoRA loaded, using the pre-trained base model.")
 
         self.model.eval()
 
@@ -108,7 +108,7 @@ class NerEtl:
     def inference(self, input_data, label):
         process_id = os.getpid()
         thread_id = threading.get_ident()
-        print(f"===== 开始处理数据 ===== process_id:{process_id}, thread_id:{thread_id}")
+        print(f"===== Start processing data ===== process_id:{process_id}, thread_id:{thread_id}")
 
         if self.model is None or self.tokenizer is None:
             raise ValueError("Model has not been loaded. Call load_model() first.")
@@ -134,19 +134,19 @@ class NerEtl:
                 pv = round(math.exp(score), 4)
                 output = self.tokenizer.decode(s, skip_special_tokens=True)
                 result = output.split('<｜Assistant｜>', 1)[-1].strip()
-                # 去掉可能的思考标记
+                # Strip out any <think>...</think> reasoning blocks
                 if '<think>' in result:
                     result = result.split('<think>', 1)[-1].strip()
                 if '</think>' in result:
                     result = result.split('</think>', 1)[-1].strip()
                 res_original.append({"predict": result, "confidence": pv})
 
-            # 按置信度排序并取前5
+            # Sort by confidence (descending) and keep the top `answer_num`
             sorted_res = sorted(res_original, key=lambda x: x["confidence"], reverse=True)
             ner_models = [{"predict": res["predict"], "confidence": res["confidence"]} for res in sorted_res[:self.answer_num]]
 
             end_time = time.time()
-            print(f"推理时间: {end_time-start_time:.2f}s")
+            print(f"Inference time: {end_time-start_time:.2f}s")
 
             return {
                 "text": input_data,
@@ -163,19 +163,19 @@ class NerEtl:
                 "label": label
             }
         finally:
-            print(f"===== 结束推理 =====")
+            print(f"===== Inference finished =====")
             torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    # ========== 全局开关：True 加载 LoRA（微调后），False 仅基座模型（微调前） ==========
-    USE_LORA = False   # 修改此处即可切换模式
+    # ========== Global switch: True → load LoRA (fine-tuned), False → base model only ==========
+    USE_LORA = False   # Flip here to switch between fine-tuned and base modes
 
-    # 实例化并加载所选模型（只加载一个）
+    # Instantiate and load the selected model (only one is loaded at a time)
     ner_etl = NerEtl(use_lora=USE_LORA)
     ner_etl.load_model()
 
-    # 读取评估数据
+    # Load the evaluation data
     file_path_data_evl = "data/CMeEE-V2/llm/CMeEE-V2_llm_mark_test.json"
     with open(file_path_data_evl, 'r', encoding='utf-8') as f:
         samplejsonArry = json.load(f)
@@ -190,13 +190,13 @@ if __name__ == "__main__":
         print(index)
         index += 1
         if index % 100 == 0:
-            print(f"已处理 {index} 条数据")
+            print(f"Processed {index} records")
         lines.append(output)
 
-    # 根据模式命名输出文件
+    # Name the output file according to the selected mode
     mode = "lora" if USE_LORA else "base"
     out_file = f"deepseek8B_ner_confidence_beams_5_{mode}.jsonl"
     with open(out_file, "w", encoding="utf-8") as file:
         for line in lines:
             file.write(f"{json.dumps(line, ensure_ascii=False)}\n")
-    print(f"处理完成，结果已保存至 {out_file}。")
+    print(f"Processing complete, results saved to {out_file}.")

@@ -18,7 +18,7 @@ torch.cuda.empty_cache()
 
 class NerEtl:
     def __init__(self):
-        # 根据实际路径修改
+        # Modify these paths to match the actual installation
         self.base_model_path = '/data/yh/HF-LLM-models/hub/models--zai-org--glm-4-9b-chat/snapshots/bd8234fe5e0c09c48637a92abb0c797cb5fa0e73'
         self.lora_model_path = '/data/yh/LLM-train-saves/zai-org--glm-4-9b-chat-mark/lora/train_lora_5epochs_indexU'
         self.tokenizer_path = self.base_model_path
@@ -27,9 +27,9 @@ class NerEtl:
         self.load_in_8bit = False
         self.load_type = torch.float16
 
-        # 多答案数量设置
+        # Number of candidate answers
         self.answer_num = 5
-        self.num_beams = 5            # 必须 >= answer_num
+        self.num_beams = 5            # Must be >= answer_num
 
         self.system_prompt = (
             "您是医学实体识别机器人。您的任务是将输入文本中的实体类别按要求输出。"
@@ -104,16 +104,18 @@ class NerEtl:
         return prompt
 
     def _clean_response(self, text: str) -> str:
-        """提取 assistant 后的内容，并彻底移除所有尾随的 <|endoftext|> 标记（含空格分隔）。"""
+        """Extract the assistant turn and strip all trailing <|endoftext|> tokens
+        (handles variants like " <|endoftext|>" with a leading space)."""
         assistant_marker = "<|assistant|>"
         if assistant_marker in text:
             result = text.split(assistant_marker)[-1]
         else:
             result = text
 
-        # 循环去除末尾空白和结束符，处理 " <|endoftext|>" 等带空格的情况
+        # Loop: strip trailing whitespace and the end-of-text token until none remain,
+        # handling cases like " <|endoftext|>" with a leading space.
         while True:
-            result = result.rstrip()  # 先去掉末尾空格
+            result = result.rstrip()  # Remove trailing whitespace
             if result.endswith("<|endoftext|>"):
                 result = result[:-len("<|endoftext|>")]
             else:
@@ -121,7 +123,7 @@ class NerEtl:
         return result.strip()
 
     def _compute_confidence_per_sequence(self, generation_output, seq_idx):
-        """基于生成步熵的置信度（针对单个序列）"""
+        """Per-token entropy-based confidence for a single sequence."""
         scores = generation_output.scores
         generated_len = len(scores)
         if generated_len == 0:
@@ -151,14 +153,14 @@ class NerEtl:
             input_text = self.generate_prompt(input_data)
             inputs = self.tokenizer(input_text, return_tensors="pt").to(self.device)
 
-            # 生成 answer_num 条候选序列
+            # Generate `answer_num` candidate sequences
             generation_output = self.model.generate(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs['attention_mask'],
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
                 generation_config=self.generation_config,
-                num_return_sequences=self.answer_num,    # 返回数量 = 5
+                num_return_sequences=self.answer_num,    # Number of returned sequences = 5
                 return_dict_in_generate=True,
                 output_scores=True,
             )
@@ -169,7 +171,7 @@ class NerEtl:
                 generation_output.sequences_scores is not None
             )
 
-            num_seq = generation_output.sequences.shape[0]  # 通常等于 answer_num
+            num_seq = generation_output.sequences.shape[0]  # Usually equals answer_num
             for i in range(num_seq):
                 raw_output = self.tokenizer.decode(
                     generation_output.sequences[i],
@@ -187,7 +189,7 @@ class NerEtl:
                     "confidence": confidence
                 })
 
-            # 按置信度降序排列
+            # Sort by confidence in descending order
             ner_models.sort(key=lambda x: x["confidence"], reverse=True)
 
             end_time = time.time()
@@ -208,7 +210,7 @@ class NerEtl:
                 "label": label
             }
         finally:
-            print(f"===== 结束推理 =====")
+            print(f"===== Inference finished =====")
             torch.cuda.empty_cache()
 
 
@@ -230,10 +232,10 @@ if __name__ == "__main__":
         print(index)
         index = index + 1
         if index % 100 == 0:
-            print(f"已处理 {index} 条数据")
+            print(f"Processed {index} records")
         lines.append(output)
 
     with open("evl_f1/llm/glm4_ner_confidence_beams5.jsonl", "w", encoding="utf-8") as file:
         for line in lines:
             file.write(json.dumps(line, ensure_ascii=False) + "\n")
-    print("处理完成，结果已保存。")
+    print("Processing complete, results saved.")

@@ -18,7 +18,7 @@ INSTRUCTION = """您是医学实体识别机器人。您的任务是将输入文
  sym :对儿童SARST细胞亚群的研究表明，与成人SARS相比，儿童[细胞下降]不明显，证明上述推测成立。"""
 
 def mark_entities_by_type(text, entities, target_type):
-    """仅标记指定类型的实体，其他实体保持原样"""
+    """Mark only entities of the given type; other entities are left as plain text."""
     marked_text = text
     type_entities = [e for e in entities if e['type'] == target_type]
     
@@ -32,7 +32,7 @@ def mark_entities_by_type(text, entities, target_type):
     return marked_text
 
 def convert_to_llm_format(data):
-    """将CMeEE数据转换为大模型训练格式"""
+    """Convert CMeEE data into the LLM training format."""
     results = []
     for item in data:
         text = item['text']
@@ -55,7 +55,7 @@ def convert_to_llm_format(data):
     return results
 
 def process_cmee_file(input_path, output_path):
-    """处理CMeEE数据文件"""
+    """Process a CMeEE data file."""
     with open(input_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     
@@ -64,8 +64,8 @@ def process_cmee_file(input_path, output_path):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(llm_data, f, ensure_ascii=False, indent=2)
     
-    print(f"处理完成: 共{len(llm_data)}条记录")
-    print(f"输出文件: {output_path}")
+    print(f"Processing complete: {len(llm_data)} records in total")
+    print(f"Output file: {output_path}")
 
 if __name__ == '__main__':
     input_file = r'data\CMeEE-V2\CMeEE-V2_train.json'

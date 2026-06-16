@@ -42,9 +42,9 @@ class NerEtl:
             " sym :对儿童SARST细胞亚群的研究表明，与成人SARS相比，儿童[细胞下降]不明显，证明上述推测成立。"
         )
 
-        # 多答案设置
-        self.answer_num = 5          # 期望返回的答案数量
-        self.num_beams = 5          # 必须 >= answer_num
+        # Multi-candidate answer configuration
+        self.answer_num = 5          # Number of answers to return
+        self.num_beams = 5          # Must be >= answer_num
         self.load_type = torch.float16
 
         self.generation_config = GenerationConfig(
@@ -52,7 +52,7 @@ class NerEtl:
             top_k=40,
             top_p=1,
             do_sample=False,
-            num_beams=self.num_beams,   # 同步为5
+            num_beams=self.num_beams,   # Keep in sync with the value above (5)
             repetition_penalty=1.1,
             max_new_tokens=2048
         )
@@ -103,15 +103,16 @@ class NerEtl:
         return prompt
 
     def _clean_response(self, text: str) -> str:
-        """提取 assistant 后的内容，并移除末尾的 <|eot_id|> 等标记"""
+        """Extract the assistant turn and strip trailing end-of-turn tokens
+        such as <|eot_id|>."""
         assistant_marker = "<|start_header_id|>assistant<|end_header_id|>\n\n"
         if assistant_marker in text:
             result = text.split(assistant_marker, 1)[-1]
         else:
-            # 回退处理
+            # Fallback: split on the bare 'assistant' marker
             result = text.split('assistant', 1)[-1] if 'assistant' in text else text
 
-        # 循环去除末尾空白和结束符
+        # Loop: strip trailing whitespace and end-of-turn markers
         while True:
             result = result.rstrip()
             if result.endswith("<|eot_id|>"):
@@ -123,7 +124,7 @@ class NerEtl:
         return result.strip()
 
     def _compute_confidence_per_sequence(self, generation_output, seq_idx):
-        """基于生成步熵的置信度（针对单个序列）"""
+        """Per-token entropy-based confidence for a single sequence."""
         scores = generation_output.scores
         generated_len = len(scores)
         if generated_len == 0:
@@ -159,7 +160,7 @@ class NerEtl:
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
                 generation_config=self.generation_config,
-                num_return_sequences=self.answer_num,    # 返回多条候选序列
+                num_return_sequences=self.answer_num,    # Return multiple candidate sequences
                 return_dict_in_generate=True,
                 output_scores=True,
             )
@@ -170,7 +171,7 @@ class NerEtl:
                 generation_output.sequences_scores is not None
             )
 
-            num_seq = generation_output.sequences.shape[0]   # 通常等于 answer_num
+            num_seq = generation_output.sequences.shape[0]   # Usually equals answer_num
             for i in range(num_seq):
                 raw_output = self.tokenizer.decode(
                     generation_output.sequences[i],
@@ -188,11 +189,11 @@ class NerEtl:
                     "confidence": confidence
                 })
 
-            # 按置信度降序排列
+            # Sort by confidence in descending order
             ner_models.sort(key=lambda x: x["confidence"], reverse=True)
 
             end_time = time.time()
-            print(f"推理时间: {end_time-start_time:.2f}s")
+            print(f"Inference time: {end_time-start_time:.2f}s")
 
             return {
                 "text": input_data,
@@ -237,4 +238,4 @@ if __name__ == "__main__":
     with open("evl_f1/llm/lla_ner_Llama3-8B-confidence_beams5.jsonl", "w", encoding="utf-8") as file:
         for line in lines:
             file.write(json.dumps(line, ensure_ascii=False) + "\n")
-    print("处理完成，结果已保存。")
+    print("Processing complete, results saved.")

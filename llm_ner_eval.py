@@ -1,9 +1,11 @@
 """
-LLM 命名实体识别 (NER) 评估脚本
-======================================
-针对 LLM 输出的 mark 格式标注 (etype : [entity]...) 评估 P/R/F1。
-支持多种匹配模式: indexMatch / startIndexMatch / endIndexMatch / entityMatch。
-可选启用位置容差 (tolerance) 与多位置候选 (keep_all_matches)。
+LLM Named Entity Recognition (NER) Evaluation Script
+====================================================
+Evaluates P/R/F1 against LLM output in the mark annotation format
+(etype : [entity]...).
+Supported match modes: indexMatch / startIndexMatch / endIndexMatch / entityMatch.
+Optionally enables position tolerance (`tolerance`) and multi-position candidates
+(`keep_all_matches`).
 """
 
 import json
@@ -13,10 +15,11 @@ import numpy as np
 
 
 # ====================================================================
-# 1. 数据加载
+# 1. Data loading
 # ====================================================================
 def load_jsonl(filepath):
-    """加载 jsonl 文件, 自动尝试 json / ast 解析, 跳过空行与解析失败行。"""
+    """Load a jsonl file, auto-attempting json / ast parsing and skipping
+    empty or unparseable lines."""
     def parse_line(line):
         line = line.strip()
         if not line:
@@ -34,26 +37,27 @@ def load_jsonl(filepath):
 
 
 # ====================================================================
-# 2. 原始文本抽取 (从 prompt 反推)
+# 2. Original text extraction (recovered from the prompt)
 # ====================================================================
-# 起始标记 (与本任务 prompt 模板的固定开头对齐)
+# Start marker — aligned with the fixed opening of the task's prompt template
 _START_MARK = "明，与成人SARS相比，儿童[细胞下降]不明显，证明上述推测成立。\n"
 
-# LLM chat 模板 end marker 候选, 按出现频率排序
+# Candidate LLM chat-template end markers, ordered by observed frequency
 _END_MARKS = [
     '<|eot_id|>',          # Llama2 / Qwen
     '<|end_of_text|>',     # Qwen
     '<|im_end|>',          # Qwen ChatML / GLM
     '<|end_turn|>',        # Gemma
     '<|assistant|>',       # GLM4
-    '<｜Assistant｜>',      # DeepSeek (全角)
+    '<｜Assistant｜>',      # DeepSeek (full-width)
     '<|start_header_id|>', # Llama3
     '<|/assistant|>',      # Mistral
 ]
 
 
 def get_promptPr(prompt, start_mark, end_mark):
-    """从 prompt 中截取 start_mark 与 end_mark 之间的子串。"""
+    """Return the substring of `prompt` that lies between `start_mark` and
+    `end_mark`, or None if not found."""
     if prompt is None:
         return None
     pattern = re.escape(start_mark) + '(.*?)' + re.escape(end_mark)
@@ -62,8 +66,9 @@ def get_promptPr(prompt, start_mark, end_mark):
 
 
 def extract_original_text(sample):
-    """从 sample 中提取原始待抽取文本。
-    优先使用 text 属性, 否则从 prompt 中按多模板 end marker 抽取。
+    """Extract the original source text from a sample.
+    Prefers the explicit `text` field; otherwise slices the `prompt` between
+    the start marker and the first matching end marker.
     """
     if 'text' in sample:
         return sample['text']
@@ -78,10 +83,11 @@ def extract_original_text(sample):
 
 
 # ====================================================================
-# 3. mark 格式标注解析
+# 3. Parsing the mark-style annotation
 # ====================================================================
 def _split_mark_line(line):
-    """将 'etype : content' 拆成 (etype, content), 失败返回 None。"""
+    """Split a line of the form 'etype : content' into (etype, content);
+    return None on failure."""
     line = line.strip()
     if not line or ' :' not in line:
         return None
@@ -92,11 +98,12 @@ def _split_mark_line(line):
 
 
 def _entities_with_pos_in_content(content):
-    """从单行 mark content 中抽取实体 (start, end, entity)。
-    start/end 是行内偏移 (剔除 [] 后), entity 已 strip。
-    兼容两种格式:
-      A) 原句 + [entity] 标记 → 精确偏移
-      B) 裸实体 (按 [、,;；] 切分) → 偏移在 content 内的实际位置
+    """Extract (start, end, entity) tuples from one mark-format content line.
+    `start`/`end` are in-line offsets (after stripping the surrounding []),
+    and `entity` is already stripped.
+    Two input forms are supported:
+      A) Original sentence with [entity] markers → exact offsets
+      B) Bare entities (split on [、,;；]) → offsets within the content
     """
     out = []
     bracket = list(re.finditer(r'\[(.*?)\]', content))
@@ -122,9 +129,11 @@ def _entities_with_pos_in_content(content):
 
 
 def parse_marked_text_with_pos(text):
-    """解析 mark 格式文本, 返回 [(start_idx, end_idx, entity, type, line_no), ...] 列表。
-    start/end 是行内偏移 (剔除 [] 后); 后续需配合 _correct_to_original_text
-    校正到 original_text 全文偏移。
+    """Parse mark-format text into a list of
+    (start_idx, end_idx, entity, type, line_no) tuples.
+    start/end are in-line offsets (after stripping []); the caller is
+    expected to realign them against the full `original_text` via
+    `_correct_to_original_text`.
     """
     result = []
     for line_idx, line in enumerate(text.strip().split('\n')):
@@ -138,7 +147,7 @@ def parse_marked_text_with_pos(text):
 
 
 def parse_marked_text_entity(text):
-    """解析 mark 格式文本, 返回 {(entity, type): entity} 字典。"""
+    """Parse mark-format text into a {(entity, type): entity} dictionary."""
     result = {}
     for line in text.strip().split('\n'):
         r = _split_mark_line(line)
@@ -153,16 +162,19 @@ def parse_marked_text_entity(text):
 
 def _correct_to_original_text(entities, original_text, tolerance=2,
                               keep_all_matches=False):
-    """将 mark 行内偏移校正到 original_text 全文中的真实位置。
-    校正规则:
-      1. 实体不在 original_text 中 → 丢弃 (LLM 幻觉, 不参与评估)
-      2. 实体在 original_text 中, 位置已正确 → 保留
-      3. 实体在 original_text 中, 位置不匹配:
-         a. 仅 1 处匹配 → 直接使用该位置
-         b. 多处匹配:
-            - keep_all_matches=False: 启用位置容差 `tolerance`, 选容差内
-              距离最近的位置; 若无, 退而选全部匹配中距离最近的位置
-            - keep_all_matches=True: 全部采用, 把每一处匹配都作为候选位置加入
+    """Realign the in-line offsets of mark entities to their true positions
+    inside `original_text`.
+    Correction rules:
+      1. Entity not present in original_text → drop (LLM hallucination, not
+         counted in evaluation).
+      2. Entity present, position already correct → keep as is.
+      3. Entity present, position mismatched:
+         a. Exactly one occurrence → use that occurrence.
+         b. Multiple occurrences:
+            - keep_all_matches=False: select the occurrence closest to the
+              predicted position within `tolerance`; if none qualifies, fall
+              back to the closest occurrence overall.
+            - keep_all_matches=True:  keep every occurrence as a candidate.
     """
     if not original_text:
         return entities
@@ -170,15 +182,15 @@ def _correct_to_original_text(entities, original_text, tolerance=2,
     for start_idx, end_idx, entity, etype, line_no in entities:
         if not entity:
             continue
-        # 1. 幻觉剔除
+        # 1. Drop hallucinations
         if entity not in original_text:
             continue
-        # 2. 位置已正确
+        # 2. Position already correct
         if 0 <= start_idx <= end_idx < len(original_text) \
                 and original_text[start_idx:end_idx + 1] == entity:
             corrected.append((start_idx, end_idx, entity, etype, line_no))
             continue
-        # 3. 搜索所有出现位置
+        # 3. Search every occurrence
         try:
             matches = list(re.finditer(re.escape(entity), original_text))
         except re.error:
@@ -203,7 +215,7 @@ def _correct_to_original_text(entities, original_text, tolerance=2,
 
 
 # ====================================================================
-# 4. 评估
+# 4. Evaluation
 # ====================================================================
 ENT_TYPES = ['bod', 'dis', 'dru', 'equ', 'ite', 'mic', 'pro', 'sym', 'dep']
 
@@ -211,19 +223,24 @@ ENT_TYPES = ['bod', 'dis', 'dru', 'equ', 'ite', 'mic', 'pro', 'sym', 'dep']
 def evaluate_entities(samples, compare_type='entityMatch',
                       external_labels=None, keep_all_matches=False,
                       tolerance=2):
-    """评估实体识别结果, 累计各类实体的 TP/FP/FN。
-    compare_type 可选:
-      - 'indexMatch':       比较 (start_idx, end_idx, type)
-      - 'startIndexMatch':  比较 (start_idx, entity, type)
-      - 'endIndexMatch':    比较 (end_idx, entity, type)
-      - 'entityMatch':      只比较 (entity, type)
-    external_labels: 可选外部 ground truth 列表 (与 samples 等长)。
-                    若提供, 元素为 [{'entity', 'start_idx', 'end_idx', 'type'}, ...],
-                    优先用此 ground truth (适合 BERT 文件 entities 字段);
-                    否则用 sample['label'] 字段 (LLM 文件内置 label, mark 格式)。
-    keep_all_matches: True 时 LLM 预测实体在 original_text 中出现多次会被全部
-                    保留为候选位置; False 时按 tolerance 选最近 1 处 (默认)。
-    tolerance: 位置容差, 默认 2。仅在 keep_all_matches=False 时生效。
+    """Evaluate entity-recognition predictions, accumulating TP/FP/FN per type.
+    `compare_type` options:
+      - 'indexMatch':       compare (start_idx, end_idx, type)
+      - 'startIndexMatch':  compare (start_idx, entity, type)
+      - 'endIndexMatch':    compare (end_idx, entity, type)
+      - 'entityMatch':      compare only (entity, type)
+    `external_labels`: optional ground-truth list (same length as samples).
+        When provided, each element is a list of
+        {'entity', 'start_idx', 'end_idx', 'type'} dicts and is used in
+        preference to `sample['label']` (suited to BERT files' `entities`
+        field); otherwise `sample['label']` is used (LLM files with an
+        embedded mark-format label).
+    `keep_all_matches`: when True, every occurrence of an LLM-predicted
+        entity inside `original_text` is kept as a candidate position; when
+        False (default), only the occurrence closest to the predicted
+        position is kept, within `tolerance`.
+    `tolerance`: position tolerance, default 2. Only effective when
+        `keep_all_matches` is False.
     """
     stats = {t: {'tp': 0, 'fp': 0, 'fn': 0} for t in ENT_TYPES}
     stats['unknown'] = {'tp': 0, 'fp': 0, 'fn': 0}
@@ -234,7 +251,8 @@ def evaluate_entities(samples, compare_type='entityMatch',
             predict = ner_models[0].get('predict', '')
         else:
             predict = sample.get('predict', '')
-            # 去除 DeepSeek/Qwen 等推理模型 <think>/</think> 包裹
+            # Strip <think>/</think> wrappers emitted by reasoning models
+            # such as DeepSeek / Qwen.
             if "</think>\n\n" in predict:
                 predict = predict.split("</think>\n\n")[1]
             if "<think>\n" in predict:
@@ -260,7 +278,7 @@ def evaluate_entities(samples, compare_type='entityMatch',
             label_entity_set = {k: v for k, v in label_entity_set.items()
                                 if v in original_text}
 
-        # 决定 ground truth 来源
+        # Choose the source of ground truth
         use_external = (external_labels is not None
                         and external_labels[idx] is not None)
         if use_external:
@@ -315,7 +333,8 @@ def evaluate_entities(samples, compare_type='entityMatch',
 
 
 def calculate_metrics(stats):
-    """根据 TP/FP/FN 计算各类实体的 Precision/Recall/F1, 并给出宏/微平均。"""
+    """Compute Precision/Recall/F1 per entity type from TP/FP/FN counts and
+    return both macro and micro averages."""
     results = {}
     for ent_type in stats:
         tp = stats[ent_type]['tp']
@@ -353,7 +372,7 @@ def calculate_metrics(stats):
 
 
 def print_results(results):
-    """格式化输出 P/R/F1/Support 表格 (按类别 + 宏/微平均)。"""
+    """Pretty-print a P/R/F1/Support table, per type plus macro/micro averages."""
     headers = ["Type", "Precision", "Recall", "F1", "Support"]
     print(f"{headers[0]:<10}{headers[1]:<12}{headers[2]:<12}"
           f"{headers[3]:<12}{headers[4]:<10}")
@@ -390,10 +409,11 @@ def print_results(results):
 
 
 # ====================================================================
-# 5. 训练/测试切分
+# 5. Train/test split
 # ====================================================================
 def split_train_test(samples, test_size=2000, seed=42):
-    """按固定种子随机切分测试集, 剩余作为训练集。返回 (train, test)。"""
+    """Randomly sample a test set with a fixed seed; the remainder is used
+    as the training pool. Returns (train, test)."""
     n = len(samples)
     rng = np.random.RandomState(seed)
     test_idx = rng.choice(np.arange(n), size=min(test_size, n), replace=False)
@@ -405,21 +425,21 @@ def split_train_test(samples, test_size=2000, seed=42):
 
 
 # ====================================================================
-# 6. 入口
+# 6. Entry point
 # ====================================================================
 if __name__ == '__main__':
     eval_file = r'evl_f1\llm\glm4_ner_confidence_beams5.jsonl'
     samples = load_jsonl(eval_file)
-    print(f"加载数据: {len(samples)} 条")
+    print(f"Loaded data: {len(samples)} records")
 
     compare_type = 'indexMatch'
-    print(f"匹配模式: {compare_type}")
+    print(f"Match mode: {compare_type}")
 
     TRAIN_SAMPLE_SIZE = 4000
     TEST_SAMPLE_SIZE = 1000
     train, test = split_train_test(samples, test_size=TEST_SAMPLE_SIZE, seed=42)
     train = train[:TRAIN_SAMPLE_SIZE]
-    print(f"训练池: {len(train)} 条, 测试集: {len(test)} 条")
+    print(f"Training pool: {len(train)} records, test set: {len(test)} records")
 
     stats = evaluate_entities(test, compare_type=compare_type)
     results = calculate_metrics(stats)
